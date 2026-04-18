@@ -10,8 +10,8 @@ const ENTRY_TF = process.env.ENTRY_TF || "5m";
 const TREND_TF = process.env.TREND_TF || "15m";
 const HTF = process.env.HTF || "1h";
 
-const MIN_SCORE_SNIPER = parseFloat(process.env.MIN_SCORE_SNIPER || "6");
-const MIN_SCORE_TREND = parseFloat(process.env.MIN_SCORE_TREND || "5");
+const MIN_SCORE_SNIPER = parseFloat(process.env.MIN_SCORE_SNIPER || "7");
+const MIN_SCORE_TREND = parseFloat(process.env.MIN_SCORE_TREND || "6");
 
 const LOOP_MS = parseInt(process.env.LOOP_MS || "60000", 10);
 const DUPLICATE_TTL_MS = parseInt(process.env.DUPLICATE_TTL_MS || "1800000", 10);
@@ -19,7 +19,7 @@ const DUPLICATE_TTL_MS = parseInt(process.env.DUPLICATE_TTL_MS || "1800000", 10)
 const lastSignalAt = new Map();
 const activeTrades = new Map();
 
-console.log("V8 PRO BOT STARTED");
+console.log("V8 WIN-RATE BOT STARTED");
 
 async function fetchKlines(symbol, interval = "5m", limit = 120) {
   try {
@@ -148,7 +148,7 @@ function fmt(n) {
   return n.toFixed(6);
 }
 
-function riskReward(entry, stop, tp2, side) {
+function riskReward(entry, stop, tp2) {
   const risk = Math.abs(entry - stop);
   const reward = Math.abs(tp2 - entry);
   if (risk <= 0) return 0;
@@ -203,7 +203,7 @@ async function checkSniper(symbol, btc) {
     ]);
 
     if (!entryData || !trendData || !htfData) return null;
-    if (btc.bias === "MIX" || btc.momentum < 0.05) return null;
+    if (btc.bias === "MIX" || btc.momentum < 0.08) return null;
 
     const c = closes(entryData);
     const o = opens(entryData);
@@ -235,7 +235,7 @@ async function checkSniper(symbol, btc) {
 
     const avgVol = avg(v.slice(-20, -1));
     const volNow = v.at(-1);
-    const volumeSpike = volNow > avgVol * 1.15;
+    const volumeSpike = volNow > avgVol * 1.2;
     if (!volumeSpike) return null;
 
     const trendLong = ema20Trend.at(-1) > ema50Trend.at(-1) && ema20Htf.at(-1) > ema50Htf.at(-1);
@@ -276,6 +276,9 @@ async function checkSniper(symbol, btc) {
     const reactionShort = Math.abs(recentHigh - prev) / atr;
     const displacement = Math.abs(prev - prev2);
 
+    // Fake breakout öldürücü
+    if (Math.abs(prev - prev2) < atr * 0.5) return null;
+
     let longScore = 0;
     longScore += trendLong ? 3 : 0;
     longScore += btc.bias === "LONG" ? 2 : 0;
@@ -315,9 +318,9 @@ async function checkSniper(symbol, btc) {
     ) {
       const stop = Math.min(ppLow, recentLow) - atr * 0.55;
       const tp1 = plannedLongEntry + (plannedLongEntry - stop) * 1.0;
-      const tp2 = plannedLongEntry + (plannedLongEntry - stop) * 2.0;
-      const rr = riskReward(plannedLongEntry, stop, tp2, "LONG");
-      if (rr < 1.5) return null;
+      const tp2 = plannedLongEntry + (plannedLongEntry - stop) * 1.8;
+      const rr = riskReward(plannedLongEntry, stop, tp2);
+      if (rr < 1.8) return null;
 
       return {
         mode: "SNIPER",
@@ -347,9 +350,9 @@ async function checkSniper(symbol, btc) {
     ) {
       const stop = Math.max(ppHigh, recentHigh) + atr * 0.55;
       const tp1 = plannedShortEntry - (stop - plannedShortEntry) * 1.0;
-      const tp2 = plannedShortEntry - (stop - plannedShortEntry) * 2.0;
-      const rr = riskReward(plannedShortEntry, stop, tp2, "SHORT");
-      if (rr < 1.5) return null;
+      const tp2 = plannedShortEntry - (stop - plannedShortEntry) * 1.8;
+      const rr = riskReward(plannedShortEntry, stop, tp2);
+      if (rr < 1.8) return null;
 
       return {
         mode: "SNIPER",
@@ -380,7 +383,7 @@ async function checkTrend(symbol, btc) {
     ]);
 
     if (!entryData || !trendData || !htfData) return null;
-    if (btc.bias === "MIX" || btc.momentum < 0.05) return null;
+    if (btc.bias === "MIX" || btc.momentum < 0.08) return null;
 
     const c = closes(entryData);
     const o = opens(entryData);
@@ -407,7 +410,7 @@ async function checkTrend(symbol, btc) {
 
     const volNow = v.at(-1);
     const avgVol = avg(v.slice(-20, -1));
-    const volumeSpike = volNow > avgVol * 1.2;
+    const volumeSpike = volNow > avgVol * 1.25;
     if (!volumeSpike) return null;
 
     const trendLong = ema20Trend.at(-1) > ema50Trend.at(-1) && ema20Htf.at(-1) > ema50Htf.at(-1);
@@ -432,28 +435,28 @@ async function checkTrend(symbol, btc) {
       shortScore += 2;
     }
 
-    if (momentum > 0.12) longScore += 1;
-    if (momentum < -0.12) shortScore += 1;
+    if (momentum > 0.15) longScore += 1;
+    if (momentum < -0.15) shortScore += 1;
 
     if (nearEma) {
       longScore += 1;
       shortScore += 1;
     }
 
-    if (candleBody > candleRange * 0.4) {
+    if (candleBody > candleRange * 0.45) {
       longScore += 1;
       shortScore += 1;
     }
 
-    if (upperWick < candleRange * 0.4) longScore += 1;
-    if (lowerWick < candleRange * 0.4) shortScore += 1;
+    if (upperWick < candleRange * 0.35) longScore += 1;
+    if (lowerWick < candleRange * 0.35) shortScore += 1;
 
     if (longScore >= MIN_SCORE_TREND) {
       const stop = prevLow5;
       const tp1 = last + Math.abs(last - stop) * 0.8;
       const tp2 = last + Math.abs(last - stop) * 1.5;
-      const rr = riskReward(last, stop, tp2, "LONG");
-      if (rr < 1.3) return null;
+      const rr = riskReward(last, stop, tp2);
+      if (rr < 1.5) return null;
 
       return {
         mode: "TREND",
@@ -472,8 +475,8 @@ async function checkTrend(symbol, btc) {
       const stop = prevHigh5;
       const tp1 = last - Math.abs(stop - last) * 0.8;
       const tp2 = last - Math.abs(stop - last) * 1.5;
-      const rr = riskReward(last, stop, tp2, "SHORT");
-      if (rr < 1.3) return null;
+      const rr = riskReward(last, stop, tp2);
+      if (rr < 1.5) return null;
 
       return {
         mode: "TREND",
