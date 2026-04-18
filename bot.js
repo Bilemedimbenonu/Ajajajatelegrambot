@@ -11,74 +11,52 @@ const MIN_SCORE_TREND = parseFloat(process.env.MIN_SCORE_TREND || "6");
 const LOOP_MS = parseInt(process.env.LOOP_MS || "60000", 10);
 const DUPLICATE_TTL_MS = parseInt(process.env.DUPLICATE_TTL_MS || "1800000", 10);
 
-// Maksimum taranacak erişilebilir coin sayısı.
-// İstersen Railway variable olarak MAX_ALLOWED_COINS ekleyebilirsin.
-const MAX_ALLOWED_COINS = parseInt(process.env.MAX_ALLOWED_COINS || "40", 10);
+const BASE_URLS = [
+  "https://fapi1.binance.com",
+  "https://fapi2.binance.com",
+  "https://fapi3.binance.com"
+];
 
 const lastSignalAt = new Map();
 const activeTrades = new Map();
 
-// Runtime içinde bulunan erişilebilir semboller
 let allowedSymbolsCache = [];
 let allowedSymbolsLastRefresh = 0;
-const ALLOWED_SYMBOLS_REFRESH_MS = 6 * 60 * 60 * 1000; // 6 saat
+const ALLOWED_SYMBOLS_REFRESH_MS = 6 * 60 * 60 * 1000;
 
 console.log("V8 AUTO-ALLOWLIST BOT STARTED");
 
-async function fetchJson(url) {
-  try {
-    const res = await fetch(url);
-    const text = await res.text();
-    let data = null;
-
+async function fetchTextWithRetry(path) {
+  for (const base of BASE_URLS) {
     try {
-      data = JSON.parse(text);
-    } catch {
-      data = null;
-    }
+      const res = await fetch(base + path);
+      if (!res.ok) continue;
+      return await res.text();
+    } catch {}
+  }
+  return null;
+}
 
-    return {
-      ok: res.ok,
-      status: res.status,
-      data,
-      raw: text
-    };
-  } catch (e) {
-    return {
-      ok: false,
-      status: 0,
-      data: null,
-      raw: String(e)
-    };
+async function fetchJsonWithRetry(path) {
+  const text = await fetchTextWithRetry(path);
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
   }
 }
 
-async function fetchKlines(symbol, interval = "5m", limit = 120, quiet = false) {
-  const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-  const res = await fetchJson(url);
-
-  if (!res.ok) {
-    if (!quiet) {
-      console.log(`Fetch failed: ${symbol} ${interval} ${res.status}`);
-    }
-    return null;
-  }
-
-  if (!Array.isArray(res.data) || res.data.length < 10 || !Array.isArray(res.data[0])) {
-    if (!quiet) {
-      console.log(`Malformed klines: ${symbol} ${interval}`);
-    }
-    return null;
-  }
-
-  return res.data;
+async function fetchKlines(symbol, interval = "5m", limit = 120) {
+  const data = await fetchJsonWithRetry(`/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+  if (!Array.isArray(data) || data.length < 10 || !Array.isArray(data[0])) return null;
+  return data;
 }
 
 async function fetchPrice(symbol) {
-  const url = `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`;
-  const res = await fetchJson(url);
-  if (!res.ok || !res.data) return null;
-  const p = parseFloat(res.data.price);
+  const data = await fetchJsonWithRetry(`/fapi/v1/ticker/price?symbol=${symbol}`);
+  if (!data) return null;
+  const p = parseFloat(data.price);
   return Number.isFinite(p) ? p : null;
 }
 
@@ -191,13 +169,13 @@ function markSignal(signalKey) {
 }
 
 async function getPerpetualTradingUsdtSymbols() {
-  const res = await fetchJson("https://fapi.binance.com/fapi/v1/exchangeInfo");
-  if (!res.ok || !res.data || !Array.isArray(res.data.symbols)) {
+  const data = await fetchJsonWithRetry("/fapi/v1/exchangeInfo");
+  if (!data || !Array.isArray(data.symbols)) {
     console.log("exchangeInfo fetch failed");
     return [];
   }
 
-  return res.data.symbols
+  return data.symbols
     .filter(s =>
       s &&
       s.quoteAsset === "USDT" &&
@@ -213,14 +191,8 @@ async function buildAllowedSymbols() {
 
   const allowed = [];
   for (const symbol of allSymbols) {
-    // Tek timeframe ile hızlı erişim testi
-    const test = await fetchKlines(symbol, "5m", 20, true);
-    if (test) {
-      allowed.push(symbol);
-    }
-    if (allowed.length >= MAX_ALLOWED_COINS) {
-      break;
-    }
+    const test = await fetchKlines(symbol, "5m", 20);
+    if (test) allowed.push(symbol);
   }
 
   return allowed;
@@ -228,9 +200,11 @@ async function buildAllowedSymbols() {
 
 async function getAllowedSymbols() {
   const now = Date.now();
-  const cacheFresh = allowedSymbolsCache.length > 0 && (now - allowedSymbolsLastRefresh) < ALLOWED_SYMBOLS_REFRESH_MS;
+  const freshEnough =
+    allowedSymbolsCache.length > 0 &&
+    (now - allowedSymbolsLastRefresh) < ALLOWED_SYMBOLS_REFRESH_MS;
 
-  if (cacheFresh) return allowedSymbolsCache;
+  if (freshEnough) return allowedSymbolsCache;
 
   const fresh = await buildAllowedSymbols();
   if (fresh.length) {
@@ -246,8 +220,8 @@ async function getAllowedSymbols() {
 
 async function getBTCBias() {
   const [trendData, htfData] = await Promise.all([
-    fetchKlines("BTCUSDT", TREND_TF, 80, true),
-    fetchKlines("BTCUSDT", HTF, 80, true),
+    fetchKlines("BTCUSDT", TREND_TF, 80),
+    fetchKlines("BTCUSDT", HTF, 80),
   ]);
 
   if (!trendData || !htfData) return { bias: "MIX", momentum: 0 };
@@ -276,9 +250,9 @@ async function getBTCBias() {
 async function checkSniper(symbol, btc) {
   try {
     const [entryData, trendData, htfData] = await Promise.all([
-      fetchKlines(symbol, ENTRY_TF, 120, true),
-      fetchKlines(symbol, TREND_TF, 120, true),
-      fetchKlines(symbol, HTF, 120, true),
+      fetchKlines(symbol, ENTRY_TF, 120),
+      fetchKlines(symbol, TREND_TF, 120),
+      fetchKlines(symbol, HTF, 120),
     ]);
 
     if (!entryData || !trendData || !htfData) return null;
@@ -312,9 +286,9 @@ async function checkSniper(symbol, btc) {
     const ppHigh = h.at(-3);
     const ppLow = l.at(-3);
 
-    const avgVol = avg(v.slice(-20, -1));
+    const avgVolNow = avg(v.slice(-20, -1));
     const volNow = v.at(-1);
-    const volumeSpike = volNow > avgVol * 1.2;
+    const volumeSpike = volNow > avgVolNow * 1.2;
     if (!volumeSpike) return null;
 
     const trendLong = ema20Trend.at(-1) > ema50Trend.at(-1) && ema20Htf.at(-1) > ema50Htf.at(-1);
@@ -454,9 +428,9 @@ async function checkSniper(symbol, btc) {
 async function checkTrend(symbol, btc) {
   try {
     const [entryData, trendData, htfData] = await Promise.all([
-      fetchKlines(symbol, ENTRY_TF, 80, true),
-      fetchKlines(symbol, TREND_TF, 80, true),
-      fetchKlines(symbol, HTF, 80, true)
+      fetchKlines(symbol, ENTRY_TF, 80),
+      fetchKlines(symbol, TREND_TF, 80),
+      fetchKlines(symbol, HTF, 80)
     ]);
 
     if (!entryData || !trendData || !htfData) return null;
@@ -486,8 +460,8 @@ async function checkTrend(symbol, btc) {
     const prevLow5 = Math.min(...l.slice(-6, -1));
 
     const volNow = v.at(-1);
-    const avgVol = avg(v.slice(-20, -1));
-    const volumeSpike = volNow > avgVol * 1.25;
+    const avgVolNow = avg(v.slice(-20, -1));
+    const volumeSpike = volNow > avgVolNow * 1.25;
     if (!volumeSpike) return null;
 
     const trendLong = ema20Trend.at(-1) > ema50Trend.at(-1) && ema20Htf.at(-1) > ema50Htf.at(-1);
