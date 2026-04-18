@@ -49,7 +49,7 @@ async function checkCoin(symbol) {
 
   const mom = calcMomentum(data);
 
-  if (mom > 0.2) {
+  if (mom > 0.1) {
     return {
       coin: symbol,
       side: "LONG",
@@ -57,7 +57,7 @@ async function checkCoin(symbol) {
     };
   }
 
-  if (mom < -0.2) {
+  if (mom < -0.1) {
     return {
       coin: symbol,
       side: "SHORT",
