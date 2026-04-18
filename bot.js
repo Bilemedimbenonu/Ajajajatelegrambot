@@ -1,6 +1,9 @@
 const TG_TOKEN = process.env.TG_BOT_TOKEN;
 const CHAT_ID = process.env.TG_CHAT_ID;
-const COINS = (process.env.COIN_LIST || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+const COINS = (process.env.COIN_LIST || "")
+  .split(",")
+  .map(s => s.trim().toUpperCase())
+  .filter(Boolean);
 
 console.log("BOT STARTED");
 
@@ -9,7 +12,10 @@ async function fetchKlines(symbol, interval = "5m") {
     const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=50`;
     const res = await fetch(url);
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.log(`Fetch failed: ${symbol} ${interval} ${res.status}`);
+      return null;
+    }
 
     const data = await res.json();
 
@@ -53,7 +59,7 @@ async function checkCoin(symbol) {
     return {
       coin: symbol,
       side: "LONG",
-      score: mom.toFixed(2),
+      score: mom.toFixed(2)
     };
   }
 
@@ -61,7 +67,7 @@ async function checkCoin(symbol) {
     return {
       coin: symbol,
       side: "SHORT",
-      score: mom.toFixed(2),
+      score: mom.toFixed(2)
     };
   }
 
@@ -78,12 +84,12 @@ async function sendTelegram(msg) {
     const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
         chat_id: CHAT_ID,
-        text: msg,
-      }),
+        text: msg
+      })
     });
 
     const text = await res.text();
@@ -95,6 +101,8 @@ async function sendTelegram(msg) {
 
 async function run() {
   console.log("RUN START");
+
+  await sendTelegram("TEST MESAJI GELDI");
 
   if (!COINS.length) {
     console.log("COIN_LIST is empty");
