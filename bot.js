@@ -17,14 +17,17 @@ const BASE_URLS = [
   "https://fapi3.binance.com"
 ];
 
+// Railway'de daha stabil olan manuel allowlist
+const COINS = (process.env.COIN_LIST || "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,DOTUSDT,ATOMUSDT,INJUSDT,NEARUSDT,APTUSDT,OPUSDT,ARBUSDT,SEIUSDT,SUIUSDT,LTCUSDT,BCHUSDT,FTMUSDT,ICPUSDT,STXUSDT,THETAUSDT,ALGOUSDT,VETUSDT,XLMUSDT,HBARUSDT,EGLDUSDT,AXSUSDT,SANDUSDT,MANAUSDT,GALAUSDT,APEUSDT,PEPEUSDT,FLOKIUSDT,BLURUSDT,ENSUSDT,CHZUSDT,CRVUSDT")
+  .split(",")
+  .map(s => s.trim().toUpperCase())
+  .filter(Boolean);
+
 const lastSignalAt = new Map();
 const activeTrades = new Map();
+const badSymbols = new Set();
 
-let allowedSymbolsCache = [];
-let allowedSymbolsLastRefresh = 0;
-const ALLOWED_SYMBOLS_REFRESH_MS = 6 * 60 * 60 * 1000;
-
-console.log("V8 AUTO-ALLOWLIST BOT STARTED");
+console.log("V8 MANUAL-ALLOWLIST BOT STARTED");
 
 async function fetchTextWithRetry(path) {
   for (const base of BASE_URLS) {
@@ -48,12 +51,18 @@ async function fetchJsonWithRetry(path) {
 }
 
 async function fetchKlines(symbol, interval = "5m", limit = 120) {
+  if (badSymbols.has(symbol)) return null;
+
   const data = await fetchJsonWithRetry(`/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
-  if (!Array.isArray(data) || data.length < 10 || !Array.isArray(data[0])) return null;
+  if (!Array.isArray(data) || data.length < 10 || !Array.isArray(data[0])) {
+    badSymbols.add(symbol);
+    return null;
+  }
   return data;
 }
 
 async function fetchPrice(symbol) {
+  if (badSymbols.has(symbol)) return null;
   const data = await fetchJsonWithRetry(`/fapi/v1/ticker/price?symbol=${symbol}`);
   if (!data) return null;
   const p = parseFloat(data.price);
@@ -166,56 +175,6 @@ function shouldSkipDuplicate(signalKey) {
 
 function markSignal(signalKey) {
   lastSignalAt.set(signalKey, Date.now());
-}
-
-async function getPerpetualTradingUsdtSymbols() {
-  const data = await fetchJsonWithRetry("/fapi/v1/exchangeInfo");
-  if (!data || !Array.isArray(data.symbols)) {
-    console.log("exchangeInfo fetch failed");
-    return [];
-  }
-
-  return data.symbols
-    .filter(s =>
-      s &&
-      s.quoteAsset === "USDT" &&
-      s.contractType === "PERPETUAL" &&
-      s.status === "TRADING"
-    )
-    .map(s => s.symbol);
-}
-
-async function buildAllowedSymbols() {
-  const allSymbols = await getPerpetualTradingUsdtSymbols();
-  if (!allSymbols.length) return [];
-
-  const allowed = [];
-  for (const symbol of allSymbols) {
-    const test = await fetchKlines(symbol, "5m", 20);
-    if (test) allowed.push(symbol);
-  }
-
-  return allowed;
-}
-
-async function getAllowedSymbols() {
-  const now = Date.now();
-  const freshEnough =
-    allowedSymbolsCache.length > 0 &&
-    (now - allowedSymbolsLastRefresh) < ALLOWED_SYMBOLS_REFRESH_MS;
-
-  if (freshEnough) return allowedSymbolsCache;
-
-  const fresh = await buildAllowedSymbols();
-  if (fresh.length) {
-    allowedSymbolsCache = fresh;
-    allowedSymbolsLastRefresh = now;
-    console.log(`Allowed symbols refreshed: ${fresh.length}`);
-  } else if (!allowedSymbolsCache.length) {
-    console.log("Allowed symbols refresh failed and cache empty");
-  }
-
-  return allowedSymbolsCache;
 }
 
 async function getBTCBias() {
@@ -651,9 +610,8 @@ async function updateActiveTrades() {
 }
 
 async function run() {
-  const allowedSymbols = await getAllowedSymbols();
-  if (!allowedSymbols.length) {
-    console.log("No allowed symbols available");
+  if (!COINS.length) {
+    console.log("COIN_LIST is empty");
     return;
   }
 
@@ -664,7 +622,7 @@ async function run() {
   let bestSniper = null;
   let bestTrend = null;
 
-  for (const coin of allowedSymbols) {
+  for (const coin of COINS) {
     const sniper = await checkSniper(coin, btc);
     if (sniper && (!bestSniper || sniper.score > bestSniper.score)) {
       bestSniper = sniper;
@@ -694,8 +652,8 @@ async function run() {
 }
 
 async function main() {
-  if (!TG_TOKEN || !CHAT_ID) {
-    console.log("Missing TG_BOT_TOKEN / TG_CHAT_ID");
+  if (!TG_TOKEN || !CHAT_ID || !COINS.length) {
+    console.log("Missing TG_BOT_TOKEN / TG_CHAT_ID / COIN_LIST");
     process.exit(1);
   }
 
