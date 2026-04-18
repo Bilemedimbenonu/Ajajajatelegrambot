@@ -1,11 +1,6 @@
 const TG_TOKEN = process.env.TG_BOT_TOKEN;
 const CHAT_ID = process.env.TG_CHAT_ID;
 
-const COINS = (process.env.COIN_LIST || "")
-  .split(",")
-  .map(s => s.trim().toUpperCase())
-  .filter(Boolean);
-
 const ENTRY_TF = process.env.ENTRY_TF || "5m";
 const TREND_TF = process.env.TREND_TF || "15m";
 const HTF = process.env.HTF || "1h";
@@ -16,45 +11,75 @@ const MIN_SCORE_TREND = parseFloat(process.env.MIN_SCORE_TREND || "6");
 const LOOP_MS = parseInt(process.env.LOOP_MS || "60000", 10);
 const DUPLICATE_TTL_MS = parseInt(process.env.DUPLICATE_TTL_MS || "1800000", 10);
 
+// Maksimum taranacak erişilebilir coin sayısı.
+// İstersen Railway variable olarak MAX_ALLOWED_COINS ekleyebilirsin.
+const MAX_ALLOWED_COINS = parseInt(process.env.MAX_ALLOWED_COINS || "40", 10);
+
 const lastSignalAt = new Map();
 const activeTrades = new Map();
 
-console.log("V8 WIN-RATE BOT STARTED");
+// Runtime içinde bulunan erişilebilir semboller
+let allowedSymbolsCache = [];
+let allowedSymbolsLastRefresh = 0;
+const ALLOWED_SYMBOLS_REFRESH_MS = 6 * 60 * 60 * 1000; // 6 saat
 
-async function fetchKlines(symbol, interval = "5m", limit = 120) {
+console.log("V8 AUTO-ALLOWLIST BOT STARTED");
+
+async function fetchJson(url) {
   try {
-    const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
     const res = await fetch(url);
+    const text = await res.text();
+    let data = null;
 
-    if (!res.ok) {
-      console.log(`Fetch failed: ${symbol} ${interval} ${res.status}`);
-      return null;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
     }
 
-    const data = await res.json();
-
-    if (!Array.isArray(data)) return null;
-    if (data.length < 10) return null;
-    if (!Array.isArray(data[0])) return null;
-
-    return data;
+    return {
+      ok: res.ok,
+      status: res.status,
+      data,
+      raw: text
+    };
   } catch (e) {
-    console.log("fetchKlines error:", symbol, interval, e?.message || e);
-    return null;
+    return {
+      ok: false,
+      status: 0,
+      data: null,
+      raw: String(e)
+    };
   }
 }
 
-async function fetchPrice(symbol) {
-  try {
-    const url = `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`;
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const data = await res.json();
-    const p = parseFloat(data.price);
-    return Number.isFinite(p) ? p : null;
-  } catch {
+async function fetchKlines(symbol, interval = "5m", limit = 120, quiet = false) {
+  const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const res = await fetchJson(url);
+
+  if (!res.ok) {
+    if (!quiet) {
+      console.log(`Fetch failed: ${symbol} ${interval} ${res.status}`);
+    }
     return null;
   }
+
+  if (!Array.isArray(res.data) || res.data.length < 10 || !Array.isArray(res.data[0])) {
+    if (!quiet) {
+      console.log(`Malformed klines: ${symbol} ${interval}`);
+    }
+    return null;
+  }
+
+  return res.data;
+}
+
+async function fetchPrice(symbol) {
+  const url = `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`;
+  const res = await fetchJson(url);
+  if (!res.ok || !res.data) return null;
+  const p = parseFloat(res.data.price);
+  return Number.isFinite(p) ? p : null;
 }
 
 function closes(data) { return data.map(x => parseFloat(x[4])); }
@@ -165,10 +190,64 @@ function markSignal(signalKey) {
   lastSignalAt.set(signalKey, Date.now());
 }
 
+async function getPerpetualTradingUsdtSymbols() {
+  const res = await fetchJson("https://fapi.binance.com/fapi/v1/exchangeInfo");
+  if (!res.ok || !res.data || !Array.isArray(res.data.symbols)) {
+    console.log("exchangeInfo fetch failed");
+    return [];
+  }
+
+  return res.data.symbols
+    .filter(s =>
+      s &&
+      s.quoteAsset === "USDT" &&
+      s.contractType === "PERPETUAL" &&
+      s.status === "TRADING"
+    )
+    .map(s => s.symbol);
+}
+
+async function buildAllowedSymbols() {
+  const allSymbols = await getPerpetualTradingUsdtSymbols();
+  if (!allSymbols.length) return [];
+
+  const allowed = [];
+  for (const symbol of allSymbols) {
+    // Tek timeframe ile hızlı erişim testi
+    const test = await fetchKlines(symbol, "5m", 20, true);
+    if (test) {
+      allowed.push(symbol);
+    }
+    if (allowed.length >= MAX_ALLOWED_COINS) {
+      break;
+    }
+  }
+
+  return allowed;
+}
+
+async function getAllowedSymbols() {
+  const now = Date.now();
+  const cacheFresh = allowedSymbolsCache.length > 0 && (now - allowedSymbolsLastRefresh) < ALLOWED_SYMBOLS_REFRESH_MS;
+
+  if (cacheFresh) return allowedSymbolsCache;
+
+  const fresh = await buildAllowedSymbols();
+  if (fresh.length) {
+    allowedSymbolsCache = fresh;
+    allowedSymbolsLastRefresh = now;
+    console.log(`Allowed symbols refreshed: ${fresh.length}`);
+  } else if (!allowedSymbolsCache.length) {
+    console.log("Allowed symbols refresh failed and cache empty");
+  }
+
+  return allowedSymbolsCache;
+}
+
 async function getBTCBias() {
   const [trendData, htfData] = await Promise.all([
-    fetchKlines("BTCUSDT", TREND_TF, 80),
-    fetchKlines("BTCUSDT", HTF, 80),
+    fetchKlines("BTCUSDT", TREND_TF, 80, true),
+    fetchKlines("BTCUSDT", HTF, 80, true),
   ]);
 
   if (!trendData || !htfData) return { bias: "MIX", momentum: 0 };
@@ -197,9 +276,9 @@ async function getBTCBias() {
 async function checkSniper(symbol, btc) {
   try {
     const [entryData, trendData, htfData] = await Promise.all([
-      fetchKlines(symbol, ENTRY_TF, 120),
-      fetchKlines(symbol, TREND_TF, 120),
-      fetchKlines(symbol, HTF, 120),
+      fetchKlines(symbol, ENTRY_TF, 120, true),
+      fetchKlines(symbol, TREND_TF, 120, true),
+      fetchKlines(symbol, HTF, 120, true),
     ]);
 
     if (!entryData || !trendData || !htfData) return null;
@@ -276,7 +355,6 @@ async function checkSniper(symbol, btc) {
     const reactionShort = Math.abs(recentHigh - prev) / atr;
     const displacement = Math.abs(prev - prev2);
 
-    // Fake breakout öldürücü
     if (Math.abs(prev - prev2) < atr * 0.5) return null;
 
     let longScore = 0;
@@ -368,8 +446,7 @@ async function checkSniper(symbol, btc) {
     }
 
     return null;
-  } catch (e) {
-    console.log("checkSniper error:", symbol, e?.message || e);
+  } catch {
     return null;
   }
 }
@@ -377,9 +454,9 @@ async function checkSniper(symbol, btc) {
 async function checkTrend(symbol, btc) {
   try {
     const [entryData, trendData, htfData] = await Promise.all([
-      fetchKlines(symbol, ENTRY_TF, 80),
-      fetchKlines(symbol, TREND_TF, 80),
-      fetchKlines(symbol, HTF, 80)
+      fetchKlines(symbol, ENTRY_TF, 80, true),
+      fetchKlines(symbol, TREND_TF, 80, true),
+      fetchKlines(symbol, HTF, 80, true)
     ]);
 
     if (!entryData || !trendData || !htfData) return null;
@@ -492,8 +569,7 @@ async function checkTrend(symbol, btc) {
     }
 
     return null;
-  } catch (e) {
-    console.log("checkTrend error:", symbol, e?.message || e);
+  } catch {
     return null;
   }
 }
@@ -535,13 +611,10 @@ Reason: ${reason}`;
 }
 
 async function sendTelegram(msg) {
-  if (!TG_TOKEN || !CHAT_ID) {
-    console.log("Missing TG_BOT_TOKEN or TG_CHAT_ID");
-    return;
-  }
+  if (!TG_TOKEN || !CHAT_ID) return;
 
   try {
-    const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
@@ -551,12 +624,7 @@ async function sendTelegram(msg) {
         text: msg
       })
     });
-
-    const text = await res.text();
-    console.log("Telegram response:", text);
-  } catch (e) {
-    console.log("Telegram send error:", e?.message || e);
-  }
+  } catch {}
 }
 
 async function updateActiveTrades() {
@@ -609,22 +677,20 @@ async function updateActiveTrades() {
 }
 
 async function run() {
-  console.log("RUN START");
-
-  if (!COINS.length) {
-    console.log("COIN_LIST is empty");
+  const allowedSymbols = await getAllowedSymbols();
+  if (!allowedSymbols.length) {
+    console.log("No allowed symbols available");
     return;
   }
 
   await updateActiveTrades();
 
   const btc = await getBTCBias();
-  console.log("BTC:", btc);
 
   let bestSniper = null;
   let bestTrend = null;
 
-  for (const coin of COINS) {
+  for (const coin of allowedSymbols) {
     const sniper = await checkSniper(coin, btc);
     if (sniper && (!bestSniper || sniper.score > bestSniper.score)) {
       bestSniper = sniper;
@@ -634,29 +700,15 @@ async function run() {
     if (trend && (!bestTrend || trend.score > bestTrend.score)) {
       bestTrend = trend;
     }
-
-    if (!sniper && !trend) {
-      console.log("No signal:", coin);
-    }
   }
 
   const best = bestSniper || bestTrend;
-  if (!best) {
-    console.log("No signal found in this cycle");
-    console.log("RUN END");
-    return;
-  }
+  if (!best) return;
 
   const signalKey = `${best.mode}:${best.coin}:${best.side}`;
-  if (shouldSkipDuplicate(signalKey)) {
-    console.log("Duplicate skipped:", signalKey);
-    console.log("RUN END");
-    return;
-  }
+  if (shouldSkipDuplicate(signalKey)) return;
 
   markSignal(signalKey);
-  console.log(`Best ${best.mode.toLowerCase()}:`, best.coin);
-
   await sendTelegram(formatSignal(best, btc));
 
   activeTrades.set(signalKey, {
@@ -665,13 +717,11 @@ async function run() {
     lastPreviewSent: false,
     createdAt: Date.now()
   });
-
-  console.log("RUN END");
 }
 
 async function main() {
-  if (!TG_TOKEN || !CHAT_ID || COINS.length === 0) {
-    console.log("Missing TG_BOT_TOKEN / TG_CHAT_ID / COIN_LIST");
+  if (!TG_TOKEN || !CHAT_ID) {
+    console.log("Missing TG_BOT_TOKEN / TG_CHAT_ID");
     process.exit(1);
   }
 
