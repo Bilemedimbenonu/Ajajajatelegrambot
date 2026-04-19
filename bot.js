@@ -1,7 +1,7 @@
 // =====================================
-// FINAL ELITE BOT
+// FINAL ELITE BOT - ALL COINS
 // Strict Trend + Sniper Scanner
-// DATA SOURCE: BYBIT
+// DATA SOURCE: OKX PUBLIC API
 // Railway / Node 18+
 // =====================================
 
@@ -12,34 +12,31 @@ const TELEGRAM_BOT_TOKEN =
 const TELEGRAM_CHAT_ID =
   process.env.TELEGRAM_CHAT_ID || process.env.TG_CHAT_ID;
 
-const DEFAULT_COINS =
-  "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,TRXUSDT,MATICUSDT,TONUSDT,SHIBUSDT,APTUSDT,NEARUSDT,OPUSDT,ARBUSDT,INJUSDT,ATOMUSDT,FTMUSDT,SUIUSDT,SEIUSDT,PEPEUSDT,FLOKIUSDT,ORDIUSDT,IMXUSDT,LDOUSDT,RUNEUSDT,GALAUSDT,SANDUSDT,MANAUSDT,AXSUSDT,CHZUSDT,UNIUSDT,AAVEUSDT,CRVUSDT,ENSUSDT,BLURUSDT,DYDXUSDT,JUPUSDT";
+// İstersen boş bırak. Boşsa bot tüm uygun coinleri OKX'ten çeker.
+const RAW_ALLOWLIST = process.env.ALLOWLIST || "";
 
-const RAW_ALLOWLIST = process.env.ALLOWLIST;
-const SCAN_INTERVAL_MS = Number(process.env.SCAN_INTERVAL_MS || 60000);
+// Daha büyük evren için biraz daha sakin tarama
+const SCAN_INTERVAL_MS = Number(process.env.SCAN_INTERVAL_MS || 180000); // 3 dk
 const MIN_SCORE = Number(process.env.MIN_SCORE || 7.5);
-const MAX_ALERTS_PER_SCAN = Number(process.env.MAX_ALERTS_PER_SCAN || 2);
+const MAX_ALERTS_PER_SCAN = Number(process.env.MAX_ALERTS_PER_SCAN || 3);
 const SIGNAL_COOLDOWN_MS = Number(process.env.SIGNAL_COOLDOWN_MS || 45 * 60 * 1000);
-
-const ALLOWLIST = (RAW_ALLOWLIST && RAW_ALLOWLIST.trim().length > 10
-  ? RAW_ALLOWLIST
-  : DEFAULT_COINS)
-  .split(",")
-  .map(x => x.trim().toUpperCase())
-  .filter(Boolean);
+const SYMBOL_BATCH_SIZE = Number(process.env.SYMBOL_BATCH_SIZE || 10);
+const BATCH_DELAY_MS = Number(process.env.BATCH_DELAY_MS || 1200);
 
 // ---------- STARTUP LOG ----------
 console.log("🚀 ELITE BOT STARTED");
 console.log("TOKEN:", TELEGRAM_BOT_TOKEN ? "OK" : "MISSING");
 console.log("CHAT ID:", TELEGRAM_CHAT_ID ? "OK" : "MISSING");
-console.log("ENV ALLOWLIST:", RAW_ALLOWLIST || "NOT FOUND -> USING DEFAULT 40");
-console.log("COINS:", ALLOWLIST.length);
+console.log("RAW_ALLOWLIST:", RAW_ALLOWLIST || "EMPTY -> WILL LOAD ALL OKX USDT SWAPS");
 console.log("SCAN_INTERVAL_MS:", SCAN_INTERVAL_MS);
 console.log("MIN_SCORE:", MIN_SCORE);
 console.log("MAX_ALERTS_PER_SCAN:", MAX_ALERTS_PER_SCAN);
+console.log("SYMBOL_BATCH_SIZE:", SYMBOL_BATCH_SIZE);
+console.log("BATCH_DELAY_MS:", BATCH_DELAY_MS);
 
 // ---------- STATE ----------
 const lastSignalMap = new Map();
+let runtimeSymbols = [];
 
 // ---------- HELPERS ----------
 function sleep(ms) {
@@ -65,6 +62,34 @@ function pctChange(a, b) {
   return ((a - b) / b) * 100;
 }
 
+function chunkArray(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) {
+    out.push(arr.slice(i, i + size));
+  }
+  return out;
+}
+
+async function fetchText(url) {
+  const res = await fetch(url, {
+    headers: {
+      "Accept": "application/json,text/plain,*/*",
+      "User-Agent": "Mozilla/5.0"
+    }
+  });
+  return res.text();
+}
+
+async function fetchJson(url) {
+  const text = await fetchText(url);
+
+  if (text.startsWith("<!DOCTYPE") || text.startsWith("<html") || text.startsWith("<!doctype")) {
+    throw new Error(`HTML response received instead of JSON for ${url}`);
+  }
+
+  return JSON.parse(text);
+}
+
 // ---------- TELEGRAM ----------
 async function sendTelegram(text) {
   try {
@@ -87,36 +112,71 @@ async function sendTelegram(text) {
     const data = await res.json();
     console.log("📨 Telegram response:", data);
   } catch (err) {
-    console.error("❌ Telegram error:", err);
+    console.error("❌ Telegram error:", err.message);
   }
 }
 
-// ---------- DATA : BYBIT ----------
-async function getKlines(symbol, interval = "5m", limit = 150) {
+// ---------- OKX SYMBOL DISCOVERY ----------
+async function getAllSymbols() {
+  try {
+    // OKX docs: GET /api/v5/public/instruments
+    const url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP";
+    const data = await fetchJson(url);
+
+    if (!data || data.code !== "0" || !Array.isArray(data.data)) {
+      console.log("❌ Invalid instruments response:", data);
+      return [];
+    }
+
+    // Sadece live + USDT settle swap'leri al
+    const symbols = data.data
+      .filter(x =>
+        x.state === "live" &&
+        x.instId &&
+        x.instId.endsWith("-USDT-SWAP")
+      )
+      .map(x => {
+        const instId = x.instId;          // ör: BTC-USDT-SWAP
+        const symbol = instId.replace(/-USDT-SWAP$/, "USDT");
+        return {
+          instId,
+          symbol
+        };
+      });
+
+    console.log(`✅ OKX instruments loaded: ${symbols.length}`);
+    return symbols;
+  } catch (err) {
+    console.log("❌ Failed to load OKX instruments:", err.message);
+    return [];
+  }
+}
+
+// ---------- DATA : OKX ----------
+async function getKlines(instId, interval = "5m", limit = 150) {
   try {
     const intervalMap = {
-      "1m": "1",
-      "3m": "3",
-      "5m": "5",
-      "15m": "15",
-      "30m": "30",
-      "1h": "60",
-      "4h": "240",
-      "1d": "D"
+      "1m": "1m",
+      "3m": "3m",
+      "5m": "5m",
+      "15m": "15m",
+      "30m": "30m",
+      "1h": "1H",
+      "4h": "4H",
+      "1d": "1D"
     };
 
-    const bybitInterval = intervalMap[interval] || "5";
-    const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=${bybitInterval}&limit=${limit}`;
+    const okxBar = intervalMap[interval] || "5m";
+    const url = `https://www.okx.com/api/v5/market/candles?instId=${encodeURIComponent(instId)}&bar=${okxBar}&limit=${limit}`;
+    const data = await fetchJson(url);
 
-    const res = await fetch(url);
-    const data = await res.json();
-
-    if (!data || data.retCode !== 0 || !data.result || !Array.isArray(data.result.list)) {
-      console.log(`❌ Invalid klines for ${symbol} ${interval}:`, data);
+    if (!data || data.code !== "0" || !Array.isArray(data.data)) {
+      console.log(`❌ Invalid klines for ${instId} ${interval}:`, data);
       return null;
     }
 
-    const list = [...data.result.list].reverse();
+    // OKX newest -> oldest, eski -> yeni çevirelim
+    const list = [...data.data].reverse();
 
     return list.map(k => ({
       openTime: Number(k[0]),
@@ -128,7 +188,7 @@ async function getKlines(symbol, interval = "5m", limit = 150) {
       closeTime: Number(k[0])
     }));
   } catch (err) {
-    console.log(`❌ Klines fetch failed for ${symbol} ${interval}:`, err.message);
+    console.log(`❌ Klines fetch failed for ${instId} ${interval}:`, err.message);
     return null;
   }
 }
@@ -232,7 +292,7 @@ function analyzeTrend(klines5m, klines15m) {
     return {
       side: "NONE",
       score: 0,
-      reasons: ["Trend mismatch across timeframes"]
+      reasons: ["Trend mismatch"]
     };
   }
 
@@ -279,12 +339,6 @@ function analyzeTrend(klines5m, klines15m) {
     side,
     score,
     price: price5,
-    ema20_5,
-    ema20_15,
-    rsi5,
-    rsi15,
-    mom5,
-    mom15,
     volumeBoost,
     reasons
   };
@@ -373,8 +427,6 @@ function analyzeSniper(klines5m, trendSide) {
   return {
     side,
     score,
-    volBoost,
-    bodyPct,
     reasons
   };
 }
@@ -403,8 +455,6 @@ function combineSignals(trend, sniper) {
     score,
     mode,
     price: trend.price,
-    trend,
-    sniper,
     reasons
   };
 }
@@ -435,8 +485,7 @@ function buildTradePlan(side, entry, klines5m) {
     stop: round(stop, 4),
     tp1: round(tp1, 4),
     tp2: round(tp2, 4),
-    rr: round(rr, 2),
-    atr: round(atrVal, 4)
+    rr: round(rr, 2)
   };
 }
 
@@ -449,97 +498,122 @@ function shouldSkipSignal(symbol, side) {
 }
 
 function markSignal(symbol, side) {
-  const key = `${symbol}_${side}`;
-  lastSignalMap.set(key, Date.now());
+  lastSignalMap.set(`${symbol}_${side}`, Date.now());
+}
+
+// ---------- SYMBOL RESOLUTION ----------
+async function resolveSymbols() {
+  if (RAW_ALLOWLIST && RAW_ALLOWLIST.trim().length > 0) {
+    const manual = RAW_ALLOWLIST.split(",")
+      .map(x => x.trim().toUpperCase())
+      .filter(Boolean)
+      .map(symbol => ({
+        symbol,
+        instId: `${symbol.replace("USDT", "")}-USDT-SWAP`
+      }));
+
+    console.log(`✅ Using manual allowlist: ${manual.length}`);
+    return manual;
+  }
+
+  const discovered = await getAllSymbols();
+  return discovered;
+}
+
+// ---------- ANALYZE ONE SYMBOL ----------
+async function analyzeOne(item) {
+  const { symbol, instId } = item;
+
+  try {
+    console.log(`➡️ Checking ${symbol}`);
+
+    const [klines5m, klines15m] = await Promise.all([
+      getKlines(instId, "5m", 150),
+      getKlines(instId, "15m", 150)
+    ]);
+
+    if (!klines5m || !klines15m) {
+      console.log(`⚠️ Missing klines: ${symbol}`);
+      return null;
+    }
+
+    const trend = analyzeTrend(klines5m, klines15m);
+    if (!trend || trend.side === "NONE") {
+      return null;
+    }
+
+    const sniper = analyzeSniper(klines5m, trend.side);
+    const combined = combineSignals(trend, sniper);
+
+    if (!combined) return null;
+    if (combined.mode === "CONFLICT") return null;
+    if (combined.score < MIN_SCORE) return null;
+    if (shouldSkipSignal(symbol, combined.side)) return null;
+
+    const plan = buildTradePlan(combined.side, combined.price, klines5m);
+    if (!plan) return null;
+    if (plan.rr < 1.0) return null;
+
+    return {
+      symbol,
+      side: combined.side,
+      mode: combined.mode,
+      score: round(combined.score, 1),
+      entry: plan.entry,
+      stop: plan.stop,
+      tp1: plan.tp1,
+      tp2: plan.tp2,
+      rr: plan.rr
+    };
+  } catch (err) {
+    console.log(`❌ Analyze failed for ${symbol}:`, err.message);
+    return null;
+  }
 }
 
 // ---------- MAIN SCAN ----------
 async function scan() {
   console.log("🔍 SCAN START");
-  let sentCount = 0;
 
-  for (const symbol of ALLOWLIST) {
+  if (!runtimeSymbols.length) {
+    runtimeSymbols = await resolveSymbols();
+    console.log(`📦 Runtime symbols loaded: ${runtimeSymbols.length}`);
+  }
+
+  let sentCount = 0;
+  const batches = chunkArray(runtimeSymbols, SYMBOL_BATCH_SIZE);
+
+  for (const batch of batches) {
     if (sentCount >= MAX_ALERTS_PER_SCAN) break;
 
-    try {
-      console.log(`➡️ Checking ${symbol}`);
+    const results = await Promise.all(batch.map(analyzeOne));
 
-      const [klines5m, klines15m] = await Promise.all([
-        getKlines(symbol, "5m", 150),
-        getKlines(symbol, "15m", 150)
-      ]);
-
-      if (!klines5m || !klines15m) {
-        console.log(`⚠️ Missing klines: ${symbol}`);
-        continue;
-      }
-
-      const trend = analyzeTrend(klines5m, klines15m);
-      if (!trend || trend.side === "NONE") {
-        console.log(`- Trend rejected: ${symbol}`);
-        continue;
-      }
-
-      const sniper = analyzeSniper(klines5m, trend.side);
-      const combined = combineSignals(trend, sniper);
-
-      if (!combined) {
-        console.log(`- Combined rejected: ${symbol}`);
-        continue;
-      }
-
-      console.log(`📊 ${symbol} | side=${combined.side} | mode=${combined.mode} | score=${round(combined.score, 2)}`);
-
-      if (combined.mode === "CONFLICT") {
-        console.log(`- Conflict skip: ${symbol}`);
-        continue;
-      }
-
-      if (combined.score < MIN_SCORE) {
-        console.log(`- Score too low: ${symbol} ${round(combined.score, 2)}`);
-        continue;
-      }
-
-      if (shouldSkipSignal(symbol, combined.side)) {
-        console.log(`- Cooldown skip: ${symbol} ${combined.side}`);
-        continue;
-      }
-
-      const plan = buildTradePlan(combined.side, combined.price, klines5m);
-      if (!plan) {
-        console.log(`- Plan build failed: ${symbol}`);
-        continue;
-      }
-
-      if (plan.rr < 1.0) {
-        console.log(`- RR too low: ${symbol} rr=${plan.rr}`);
-        continue;
-      }
+    for (const signal of results) {
+      if (!signal) continue;
+      if (sentCount >= MAX_ALERTS_PER_SCAN) break;
 
       const msg =
-`🔥 ${symbol}
-Mode: ${combined.mode}
-Side: ${combined.side}
-Score: ${round(combined.score, 1)}/10
+`🔥 ${signal.symbol}
+Mode: ${signal.mode}
+Side: ${signal.side}
+Score: ${signal.score}/10
 
-Entry: ${plan.entry}
-Stop: ${plan.stop}
-TP1: ${plan.tp1}
-TP2: ${plan.tp2}
-RR: ${plan.rr}
+Entry: ${signal.entry}
+Stop: ${signal.stop}
+TP1: ${signal.tp1}
+TP2: ${signal.tp2}
+RR: ${signal.rr}
 
 Decision: ENTER`;
 
       await sendTelegram(msg);
-      markSignal(symbol, combined.side);
-
-      console.log(`✅ SIGNAL SENT: ${symbol} ${combined.side} score=${round(combined.score, 2)}`);
+      markSignal(signal.symbol, signal.side);
+      console.log(`✅ SIGNAL SENT: ${signal.symbol} ${signal.side} score=${signal.score}`);
       sentCount++;
-
-      await sleep(500);
-    } catch (err) {
-      console.error(`❌ Scan error on ${symbol}:`, err);
+      await sleep(400);
     }
+
+    await sleep(BATCH_DELAY_MS);
   }
 
   console.log("✅ SCAN END");
@@ -547,7 +621,8 @@ Decision: ENTER`;
 
 // ---------- START ----------
 async function start() {
-  await sendTelegram(`🚀 BOT LIVE | COINS: ${ALLOWLIST.length} | MODE: ELITE TREND + SNIPER | SOURCE: BYBIT`);
+  runtimeSymbols = await resolveSymbols();
+  await sendTelegram(`🚀 BOT LIVE | SYMBOLS: ${runtimeSymbols.length} | MODE: ELITE TREND + SNIPER | SOURCE: OKX`);
   await scan();
   setInterval(scan, SCAN_INTERVAL_MS);
 }
