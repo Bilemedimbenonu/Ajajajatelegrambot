@@ -1,48 +1,58 @@
 // =======================
-// 🔥 FULL DEBUG SCANNER BOT
+// 🚀 WORKING TELEGRAM SCANNER BOT
 // =======================
 
-import fetch from "node-fetch";
+// ❌ node-fetch YOK (EN ÖNEMLİ FİX)
 
 // ===== ENV =====
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const ALLOWLIST_RAW = process.env.ALLOWLIST || "BTCUSDT,ETHUSDT,SOLUSDT";
 
-// ===== PARSE ALLOWLIST =====
+// ===== PARSE =====
 const ALLOWLIST = ALLOWLIST_RAW.split(",")
   .map(x => x.trim())
   .filter(Boolean);
 
 // ===== START LOG =====
 console.log("🚀 BOT STARTED");
-console.log("ALLOWLIST RAW:", ALLOWLIST_RAW);
-console.log("ALLOWLIST PARSED:", ALLOWLIST);
-console.log("ALLOWLIST COUNT:", ALLOWLIST.length);
-console.log("TELEGRAM TOKEN:", TELEGRAM_BOT_TOKEN ? "OK" : "MISSING");
-console.log("TELEGRAM CHAT ID:", TELEGRAM_CHAT_ID || "MISSING");
+console.log("ALLOWLIST:", ALLOWLIST);
+console.log("TOKEN:", TELEGRAM_BOT_TOKEN ? "OK" : "MISSING");
+console.log("CHAT ID:", TELEGRAM_CHAT_ID || "MISSING");
 
-// ===== TELEGRAM TEST =====
-async function testTelegram() {
+// ===== TELEGRAM SEND =====
+async function sendTelegram(text) {
   try {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text: "✅ TEST MESSAGE - BOT ONLINE"
-      })
-    });
+    console.log("📤 Sending:", text);
+
+    const res = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHAT_ID,
+          text: text
+        })
+      }
+    );
 
     const data = await res.json();
-    console.log("📨 TELEGRAM TEST RESPONSE:", data);
+    console.log("📨 Telegram response:", data);
+
   } catch (err) {
-    console.error("❌ TELEGRAM ERROR:", err);
+    console.error("❌ Telegram error:", err);
   }
 }
 
-// ===== BINANCE FETCH =====
+// ===== TELEGRAM TEST =====
+async function testTelegram() {
+  await sendTelegram("✅ TEST MESSAGE - BOT ONLINE");
+}
+
+// ===== BINANCE PRICE =====
 async function getPrice(symbol) {
   try {
     const res = await fetch(
@@ -51,77 +61,48 @@ async function getPrice(symbol) {
     const data = await res.json();
     return Number(data.price);
   } catch (err) {
-    console.error(`❌ BINANCE ERROR (${symbol}):`, err);
+    console.error(`❌ Binance error (${symbol}):`, err);
     return null;
   }
 }
 
-// ===== SCAN LOOP =====
+// ===== SCAN =====
 async function scan() {
   console.log("🔍 SCAN STARTED");
 
   for (const symbol of ALLOWLIST) {
     try {
-      console.log(`➡️ Checking ${symbol}...`);
+      console.log(`➡️ Checking ${symbol}`);
 
       const price = await getPrice(symbol);
 
       if (!price) {
-        console.log(`⚠️ No price for ${symbol}`);
+        console.log(`⚠️ No data for ${symbol}`);
         continue;
       }
 
-      console.log(`💰 ${symbol} PRICE: ${price}`);
+      console.log(`💰 ${symbol}: ${price}`);
 
-      // ===== BASIT SİNYAL (TEST AMAÇLI) =====
-      // Her coin için FAKE sinyal üretelim ki pipeline test edilsin
-
-      const message = `🔥 TEST SIGNAL\n${symbol}\nPrice: ${price}`;
+      // ===== TEST SIGNAL =====
+      const message = `🔥 SIGNAL\n${symbol}\nPrice: ${price}`;
 
       await sendTelegram(message);
 
     } catch (err) {
-      console.error(`❌ SCAN ERROR (${symbol}):`, err);
+      console.error(`❌ Scan error (${symbol}):`, err);
     }
   }
 
-  console.log("✅ SCAN COMPLETED");
+  console.log("✅ SCAN DONE");
 }
 
-// ===== TELEGRAM SEND =====
-async function sendTelegram(text) {
-  try {
-    console.log("📤 SENDING TELEGRAM:", text);
-
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text: text
-      })
-    });
-
-    const data = await res.json();
-
-    console.log("📨 TELEGRAM RESPONSE:", data);
-
-  } catch (err) {
-    console.error("❌ TELEGRAM SEND ERROR:", err);
-  }
-}
-
-// ===== RUN =====
+// ===== START =====
 async function start() {
-  await testTelegram();
+  await testTelegram();   // Telegram çalışıyor mu test
 
-  // İlk scan hemen
-  await scan();
+  await scan();           // ilk scan
 
-  // Sonra sürekli çalışsın
-  setInterval(scan, 20000);
+  setInterval(scan, 20000); // 20 saniyede bir tekrar
 }
 
 start();
