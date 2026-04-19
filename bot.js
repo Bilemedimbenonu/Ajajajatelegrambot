@@ -1,13 +1,16 @@
 // =======================
-// 🚀 WORKING TELEGRAM SCANNER BOT
+// 🚀 FINAL WORKING BOT (BINANCE + FALLBACK)
 // =======================
 
-// ❌ node-fetch YOK (EN ÖNEMLİ FİX)
-
 // ===== ENV =====
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const ALLOWLIST_RAW = process.env.ALLOWLIST || "BTCUSDT,ETHUSDT,SOLUSDT";
+const TELEGRAM_BOT_TOKEN =
+  process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN;
+
+const TELEGRAM_CHAT_ID =
+  process.env.TELEGRAM_CHAT_ID || process.env.TG_CHAT_ID;
+
+const ALLOWLIST_RAW =
+  process.env.ALLOWLIST || "BTCUSDT,ETHUSDT,SOLUSDT";
 
 // ===== PARSE =====
 const ALLOWLIST = ALLOWLIST_RAW.split(",")
@@ -20,7 +23,7 @@ console.log("ALLOWLIST:", ALLOWLIST);
 console.log("TOKEN:", TELEGRAM_BOT_TOKEN ? "OK" : "MISSING");
 console.log("CHAT ID:", TELEGRAM_CHAT_ID || "MISSING");
 
-// ===== TELEGRAM SEND =====
+// ===== TELEGRAM =====
 async function sendTelegram(text) {
   try {
     console.log("📤 Sending:", text);
@@ -41,29 +44,72 @@ async function sendTelegram(text) {
 
     const data = await res.json();
     console.log("📨 Telegram response:", data);
-
   } catch (err) {
     console.error("❌ Telegram error:", err);
   }
 }
 
-// ===== TELEGRAM TEST =====
-async function testTelegram() {
-  await sendTelegram("✅ TEST MESSAGE - BOT ONLINE");
-}
-
 // ===== BINANCE PRICE =====
-async function getPrice(symbol) {
+async function getBinancePrice(symbol) {
   try {
-    const res = await fetch(
-      `https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`
-    );
+    const url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`;
+    const res = await fetch(url);
     const data = await res.json();
-    return Number(data.price);
+
+    if (!data.lastPrice) return null;
+
+    return Number(data.lastPrice);
   } catch (err) {
-    console.error(`❌ Binance error (${symbol}):`, err);
+    console.log("⚠️ Binance failed:", symbol);
     return null;
   }
+}
+
+// ===== COINGECKO FALLBACK =====
+async function getCoinGeckoPrice(symbol) {
+  try {
+    const map = {
+      BTCUSDT: "bitcoin",
+      ETHUSDT: "ethereum",
+      SOLUSDT: "solana"
+    };
+
+    const id = map[symbol];
+    if (!id) return null;
+
+    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`;
+    const res = await fetch(url);
+    const data = await res.json();
+
+    if (!data[id]) return null;
+
+    return data[id].usd;
+  } catch (err) {
+    console.log("⚠️ CoinGecko failed:", symbol);
+    return null;
+  }
+}
+
+// ===== GET PRICE =====
+async function getPrice(symbol) {
+  let price = await getBinancePrice(symbol);
+
+  if (price) {
+    console.log(`💰 ${symbol} Binance: ${price}`);
+    return price;
+  }
+
+  console.log(`⚠️ Binance failed, fallback CoinGecko: ${symbol}`);
+
+  price = await getCoinGeckoPrice(symbol);
+
+  if (price) {
+    console.log(`💰 ${symbol} CoinGecko: ${price}`);
+    return price;
+  }
+
+  console.log(`❌ No data for ${symbol}`);
+  return null;
 }
 
 // ===== SCAN =====
@@ -71,26 +117,13 @@ async function scan() {
   console.log("🔍 SCAN STARTED");
 
   for (const symbol of ALLOWLIST) {
-    try {
-      console.log(`➡️ Checking ${symbol}`);
+    const price = await getPrice(symbol);
 
-      const price = await getPrice(symbol);
+    if (!price) continue;
 
-      if (!price) {
-        console.log(`⚠️ No data for ${symbol}`);
-        continue;
-      }
+    const msg = `🔥 SIGNAL\n${symbol}\nPrice: ${price}`;
 
-      console.log(`💰 ${symbol}: ${price}`);
-
-      // ===== TEST SIGNAL =====
-      const message = `🔥 SIGNAL\n${symbol}\nPrice: ${price}`;
-
-      await sendTelegram(message);
-
-    } catch (err) {
-      console.error(`❌ Scan error (${symbol}):`, err);
-    }
+    await sendTelegram(msg);
   }
 
   console.log("✅ SCAN DONE");
@@ -98,11 +131,11 @@ async function scan() {
 
 // ===== START =====
 async function start() {
-  await testTelegram();   // Telegram çalışıyor mu test
+  await sendTelegram("✅ BOT ONLINE");
 
-  await scan();           // ilk scan
+  await scan();
 
-  setInterval(scan, 20000); // 20 saniyede bir tekrar
+  setInterval(scan, 20000);
 }
 
 start();
