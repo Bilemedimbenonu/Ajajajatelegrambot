@@ -1,6 +1,7 @@
 // =====================================
 // FINAL ELITE BOT
 // Strict Trend + Sniper Scanner
+// DATA SOURCE: BYBIT
 // Railway / Node 18+
 // =====================================
 
@@ -19,7 +20,6 @@ const SCAN_INTERVAL_MS = Number(process.env.SCAN_INTERVAL_MS || 60000);
 const MIN_SCORE = Number(process.env.MIN_SCORE || 7.5);
 const MAX_ALERTS_PER_SCAN = Number(process.env.MAX_ALERTS_PER_SCAN || 2);
 const SIGNAL_COOLDOWN_MS = Number(process.env.SIGNAL_COOLDOWN_MS || 45 * 60 * 1000);
-const MIN_NOTIONAL_FILTER = Number(process.env.MIN_NOTIONAL_FILTER || 0); // placeholder for future use
 
 const ALLOWLIST = (RAW_ALLOWLIST && RAW_ALLOWLIST.trim().length > 10
   ? RAW_ALLOWLIST
@@ -91,29 +91,44 @@ async function sendTelegram(text) {
   }
 }
 
-// ---------- DATA ----------
+// ---------- DATA : BYBIT ----------
 async function getKlines(symbol, interval = "5m", limit = 150) {
   try {
-    const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    const intervalMap = {
+      "1m": "1",
+      "3m": "3",
+      "5m": "5",
+      "15m": "15",
+      "30m": "30",
+      "1h": "60",
+      "4h": "240",
+      "1d": "D"
+    };
+
+    const bybitInterval = intervalMap[interval] || "5";
+    const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=${bybitInterval}&limit=${limit}`;
+
     const res = await fetch(url);
     const data = await res.json();
 
-    if (!Array.isArray(data)) {
+    if (!data || data.retCode !== 0 || !data.result || !Array.isArray(data.result.list)) {
       console.log(`❌ Invalid klines for ${symbol} ${interval}:`, data);
       return null;
     }
 
-    return data.map(k => ({
-      openTime: k[0],
+    const list = [...data.result.list].reverse();
+
+    return list.map(k => ({
+      openTime: Number(k[0]),
       open: Number(k[1]),
       high: Number(k[2]),
       low: Number(k[3]),
       close: Number(k[4]),
       volume: Number(k[5]),
-      closeTime: k[6]
+      closeTime: Number(k[0])
     }));
   } catch (err) {
-    console.log(`❌ Klines fetch failed for ${symbol} ${interval}`);
+    console.log(`❌ Klines fetch failed for ${symbol} ${interval}:`, err.message);
     return null;
   }
 }
@@ -532,7 +547,7 @@ Decision: ENTER`;
 
 // ---------- START ----------
 async function start() {
-  await sendTelegram(`🚀 BOT LIVE | COINS: ${ALLOWLIST.length} | MODE: ELITE TREND + SNIPER`);
+  await sendTelegram(`🚀 BOT LIVE | COINS: ${ALLOWLIST.length} | MODE: ELITE TREND + SNIPER | SOURCE: BYBIT`);
   await scan();
   setInterval(scan, SCAN_INTERVAL_MS);
 }
