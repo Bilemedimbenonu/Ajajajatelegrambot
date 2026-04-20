@@ -1,630 +1,679 @@
-// =====================================
-// FINAL ELITE BOT - ALL COINS
-// Strict Trend + Sniper Scanner
-// DATA SOURCE: OKX PUBLIC API
-// Railway / Node 18+
-// =====================================
+const TG_TOKEN = process.env.TG_BOT_TOKEN;
+const CHAT_ID = process.env.TG_CHAT_ID;
 
-// ---------- ENV ----------
-const TELEGRAM_BOT_TOKEN =
-  process.env.TELEGRAM_BOT_TOKEN || process.env.TG_BOT_TOKEN;
+const ENTRY_TF = process.env.ENTRY_TF || "5m";
+const TREND_TF = process.env.TREND_TF || "15m";
+const HTF = process.env.HTF || "1h";
 
-const TELEGRAM_CHAT_ID =
-  process.env.TELEGRAM_CHAT_ID || process.env.TG_CHAT_ID;
+const MIN_SCORE_SNIPER = parseFloat(process.env.MIN_SCORE_SNIPER || "7.5");
+const MIN_SCORE_TREND = parseFloat(process.env.MIN_SCORE_TREND || "6.5");
 
-// İstersen boş bırak. Boşsa bot tüm uygun coinleri OKX'ten çeker.
-const RAW_ALLOWLIST = process.env.ALLOWLIST || "";
+const MIN_RR_SNIPER = parseFloat(process.env.MIN_RR_SNIPER || "2.0");
+const MIN_RR_TREND = parseFloat(process.env.MIN_RR_TREND || "1.8");
 
-// Daha büyük evren için biraz daha sakin tarama
-const SCAN_INTERVAL_MS = Number(process.env.SCAN_INTERVAL_MS || 180000); // 3 dk
-const MIN_SCORE = Number(process.env.MIN_SCORE || 7.5);
-const MAX_ALERTS_PER_SCAN = Number(process.env.MAX_ALERTS_PER_SCAN || 3);
-const SIGNAL_COOLDOWN_MS = Number(process.env.SIGNAL_COOLDOWN_MS || 45 * 60 * 1000);
-const SYMBOL_BATCH_SIZE = Number(process.env.SYMBOL_BATCH_SIZE || 10);
-const BATCH_DELAY_MS = Number(process.env.BATCH_DELAY_MS || 1200);
+const LOOP_MS = parseInt(process.env.LOOP_MS || "60000", 10);
+const DUPLICATE_TTL_MS = parseInt(process.env.DUPLICATE_TTL_MS || "2700000", 10); // 45 dk
 
-// ---------- STARTUP LOG ----------
-console.log("🚀 ELITE BOT STARTED");
-console.log("TOKEN:", TELEGRAM_BOT_TOKEN ? "OK" : "MISSING");
-console.log("CHAT ID:", TELEGRAM_CHAT_ID ? "OK" : "MISSING");
-console.log("RAW_ALLOWLIST:", RAW_ALLOWLIST || "EMPTY -> WILL LOAD ALL OKX USDT SWAPS");
-console.log("SCAN_INTERVAL_MS:", SCAN_INTERVAL_MS);
-console.log("MIN_SCORE:", MIN_SCORE);
-console.log("MAX_ALERTS_PER_SCAN:", MAX_ALERTS_PER_SCAN);
-console.log("SYMBOL_BATCH_SIZE:", SYMBOL_BATCH_SIZE);
-console.log("BATCH_DELAY_MS:", BATCH_DELAY_MS);
+const BASE_URLS = [
+  "https://fapi1.binance.com",
+  "https://fapi2.binance.com",
+  "https://fapi3.binance.com"
+];
 
-// ---------- STATE ----------
-const lastSignalMap = new Map();
-let runtimeSymbols = [];
+const COINS = (process.env.COIN_LIST || "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,DOTUSDT,ATOMUSDT,INJUSDT,NEARUSDT,APTUSDT,OPUSDT,ARBUSDT,SEIUSDT,SUIUSDT,LTCUSDT,BCHUSDT,FTMUSDT,ICPUSDT,STXUSDT,THETAUSDT,ALGOUSDT,VETUSDT,XLMUSDT,HBARUSDT,EGLDUSDT,AXSUSDT,SANDUSDT,MANAUSDT,GALAUSDT,APEUSDT,PEPEUSDT,FLOKIUSDT,BLURUSDT,ENSUSDT,CHZUSDT,CRVUSDT")
+  .split(",")
+  .map(s => s.trim().toUpperCase())
+  .filter(Boolean);
 
-// ---------- HELPERS ----------
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+const lastSignalAt = new Map();
+const badSymbols = new Set();
+
+// Tek aktif trade mantığı
+let activeTrade = null;
+
+console.log("V8 STRICT BOT STARTED");
+
+async function fetchTextWithRetry(path) {
+  for (const base of BASE_URLS) {
+    try {
+      const res = await fetch(base + path);
+      if (!res.ok) continue;
+      return await res.text();
+    } catch {}
+  }
+  return null;
 }
 
-function round(value, digits = 4) {
-  if (!Number.isFinite(value)) return null;
-  return Number(value.toFixed(digits));
+async function fetchJsonWithRetry(path) {
+  const text = await fetchTextWithRetry(path);
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
 }
 
-function avg(values) {
-  if (!Array.isArray(values) || values.length === 0) return 0;
-  return values.reduce((a, b) => a + b, 0) / values.length;
+async function fetchKlines(symbol, interval = "5m", limit = 120) {
+  if (badSymbols.has(symbol)) return null;
+  const data = await fetchJsonWithRetry(`/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+  if (!Array.isArray(data) || data.length < 10 || !Array.isArray(data[0])) {
+    badSymbols.add(symbol);
+    return null;
+  }
+  return data;
 }
 
-function isValidNumber(v) {
-  return Number.isFinite(v) && !Number.isNaN(v);
+async function fetchPrice(symbol) {
+  if (badSymbols.has(symbol)) return null;
+  const data = await fetchJsonWithRetry(`/fapi/v1/ticker/price?symbol=${symbol}`);
+  if (!data) return null;
+  const p = parseFloat(data.price);
+  return Number.isFinite(p) ? p : null;
 }
 
-function pctChange(a, b) {
-  if (!isValidNumber(a) || !isValidNumber(b) || b === 0) return 0;
-  return ((a - b) / b) * 100;
+function closes(data) { return data.map(x => parseFloat(x[4])); }
+function opens(data) { return data.map(x => parseFloat(x[1])); }
+function highs(data) { return data.map(x => parseFloat(x[2])); }
+function lows(data) { return data.map(x => parseFloat(x[3])); }
+function volumes(data) { return data.map(x => parseFloat(x[5])); }
+
+function avg(arr) {
+  if (!arr?.length) return 0;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
 
-function chunkArray(arr, size) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) {
-    out.push(arr.slice(i, i + size));
+function ema(values, period) {
+  if (!values?.length) return [];
+  const k = 2 / (period + 1);
+  let prev = values[0];
+  const out = [prev];
+  for (let i = 1; i < values.length; i++) {
+    prev = values[i] * k + prev * (1 - k);
+    out.push(prev);
   }
   return out;
 }
 
-async function fetchText(url) {
-  const res = await fetch(url, {
-    headers: {
-      "Accept": "application/json,text/plain,*/*",
-      "User-Agent": "Mozilla/5.0"
-    }
-  });
-  return res.text();
+function pctMove(from, to) {
+  if (!Number.isFinite(from) || !Number.isFinite(to) || from === 0) return 0;
+  return ((to - from) / from) * 100;
 }
 
-async function fetchJson(url) {
-  const text = await fetchText(url);
-
-  if (text.startsWith("<!DOCTYPE") || text.startsWith("<html") || text.startsWith("<!doctype")) {
-    throw new Error(`HTML response received instead of JSON for ${url}`);
-  }
-
-  return JSON.parse(text);
-}
-
-// ---------- TELEGRAM ----------
-async function sendTelegram(text) {
-  try {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-      console.log("❌ Telegram env missing. Message skipped.");
-      return;
-    }
-
-    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text
-      })
-    });
-
-    const data = await res.json();
-    console.log("📨 Telegram response:", data);
-  } catch (err) {
-    console.error("❌ Telegram error:", err.message);
-  }
-}
-
-// ---------- OKX SYMBOL DISCOVERY ----------
-async function getAllSymbols() {
-  try {
-    // OKX docs: GET /api/v5/public/instruments
-    const url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP";
-    const data = await fetchJson(url);
-
-    if (!data || data.code !== "0" || !Array.isArray(data.data)) {
-      console.log("❌ Invalid instruments response:", data);
-      return [];
-    }
-
-    // Sadece live + USDT settle swap'leri al
-    const symbols = data.data
-      .filter(x =>
-        x.state === "live" &&
-        x.instId &&
-        x.instId.endsWith("-USDT-SWAP")
-      )
-      .map(x => {
-        const instId = x.instId;          // ör: BTC-USDT-SWAP
-        const symbol = instId.replace(/-USDT-SWAP$/, "USDT");
-        return {
-          instId,
-          symbol
-        };
-      });
-
-    console.log(`✅ OKX instruments loaded: ${symbols.length}`);
-    return symbols;
-  } catch (err) {
-    console.log("❌ Failed to load OKX instruments:", err.message);
-    return [];
-  }
-}
-
-// ---------- DATA : OKX ----------
-async function getKlines(instId, interval = "5m", limit = 150) {
-  try {
-    const intervalMap = {
-      "1m": "1m",
-      "3m": "3m",
-      "5m": "5m",
-      "15m": "15m",
-      "30m": "30m",
-      "1h": "1H",
-      "4h": "4H",
-      "1d": "1D"
-    };
-
-    const okxBar = intervalMap[interval] || "5m";
-    const url = `https://www.okx.com/api/v5/market/candles?instId=${encodeURIComponent(instId)}&bar=${okxBar}&limit=${limit}`;
-    const data = await fetchJson(url);
-
-    if (!data || data.code !== "0" || !Array.isArray(data.data)) {
-      console.log(`❌ Invalid klines for ${instId} ${interval}:`, data);
-      return null;
-    }
-
-    // OKX newest -> oldest, eski -> yeni çevirelim
-    const list = [...data.data].reverse();
-
-    return list.map(k => ({
-      openTime: Number(k[0]),
-      open: Number(k[1]),
-      high: Number(k[2]),
-      low: Number(k[3]),
-      close: Number(k[4]),
-      volume: Number(k[5]),
-      closeTime: Number(k[0])
-    }));
-  } catch (err) {
-    console.log(`❌ Klines fetch failed for ${instId} ${interval}:`, err.message);
-    return null;
-  }
-}
-
-// ---------- INDICATORS ----------
-function ema(values, length = 20) {
-  if (!Array.isArray(values) || values.length < length) return null;
-
-  const k = 2 / (length + 1);
-  let current = avg(values.slice(0, length));
-
-  for (let i = length; i < values.length; i++) {
-    current = values[i] * k + current * (1 - k);
-  }
-
-  return current;
-}
-
-function rsi(values, length = 14) {
-  if (!Array.isArray(values) || values.length < length + 1) return null;
+function calcRSI(closesArr, period = 14) {
+  if (closesArr.length < period + 1) return [50];
 
   let gains = 0;
   let losses = 0;
-
-  for (let i = 1; i <= length; i++) {
-    const diff = values[i] - values[i - 1];
-    if (diff >= 0) gains += diff;
-    else losses += Math.abs(diff);
+  for (let i = 1; i <= period; i++) {
+    const d = closesArr[i] - closesArr[i - 1];
+    if (d >= 0) gains += d;
+    else losses -= d;
   }
 
-  let avgGain = gains / length;
-  let avgLoss = losses / length;
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+  const out = [50];
 
-  for (let i = length + 1; i < values.length; i++) {
-    const diff = values[i] - values[i - 1];
-    const gain = diff > 0 ? diff : 0;
-    const loss = diff < 0 ? Math.abs(diff) : 0;
+  for (let i = period + 1; i < closesArr.length; i++) {
+    const d = closesArr[i] - closesArr[i - 1];
+    const gain = Math.max(d, 0);
+    const loss = Math.max(-d, 0);
 
-    avgGain = ((avgGain * (length - 1)) + gain) / length;
-    avgLoss = ((avgLoss * (length - 1)) + loss) / length;
+    avgGain = ((avgGain * (period - 1)) + gain) / period;
+    avgLoss = ((avgLoss * (period - 1)) + loss) / period;
+
+    const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+    out.push(100 - (100 / (1 + rs)));
   }
 
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
+  return out;
 }
 
-function atr(klines, length = 14) {
-  if (!Array.isArray(klines) || klines.length < length + 1) return null;
+function atrFromKlines(klines, period = 14) {
+  if (!Array.isArray(klines) || klines.length < period + 2) return null;
+
+  const h = highs(klines);
+  const l = lows(klines);
+  const c = closes(klines);
 
   const trs = [];
   for (let i = 1; i < klines.length; i++) {
-    const h = klines[i].high;
-    const l = klines[i].low;
-    const pc = klines[i - 1].close;
-    trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+    trs.push(
+      Math.max(
+        h[i] - l[i],
+        Math.abs(h[i] - c[i - 1]),
+        Math.abs(l[i] - c[i - 1])
+      )
+    );
   }
 
-  return avg(trs.slice(-length));
+  let atr = avg(trs.slice(0, period));
+  for (let i = period; i < trs.length; i++) {
+    atr = ((atr * (period - 1)) + trs[i]) / period;
+  }
+  return atr;
 }
 
-// ---------- ANALYSIS ----------
-function analyzeTrend(klines5m, klines15m) {
-  const closes5 = klines5m.map(x => x.close);
-  const closes15 = klines15m.map(x => x.close);
-  const vols5 = klines5m.map(x => x.volume);
-
-  const price5 = closes5.at(-1);
-  const price15 = closes15.at(-1);
-
-  const ema20_5 = ema(closes5, 20);
-  const ema20_15 = ema(closes15, 20);
-
-  const rsi5 = rsi(closes5, 14);
-  const rsi15 = rsi(closes15, 14);
-
-  const mom5 = pctChange(closes5.at(-1), closes5.at(-4));
-  const mom15 = pctChange(closes15.at(-1), closes15.at(-4));
-
-  const lastVol = vols5.at(-1);
-  const avgVol = avg(vols5.slice(-11, -1));
-  const volumeBoost = avgVol > 0 ? lastVol / avgVol : 0;
-
-  if (![price5, price15, ema20_5, ema20_15, rsi5, rsi15, mom5, mom15, volumeBoost].every(isValidNumber)) {
-    return null;
-  }
-
-  let side = "NONE";
-  let score = 0;
-  const reasons = [];
-
-  if (price5 > ema20_5 && price15 > ema20_15) {
-    side = "LONG";
-    score += 3.0;
-    reasons.push("5m+15m above EMA20");
-  } else if (price5 < ema20_5 && price15 < ema20_15) {
-    side = "SHORT";
-    score += 3.0;
-    reasons.push("5m+15m below EMA20");
-  } else {
-    return {
-      side: "NONE",
-      score: 0,
-      reasons: ["Trend mismatch"]
-    };
-  }
-
-  if (side === "LONG" && rsi5 >= 56) {
-    score += 1.0;
-    reasons.push("RSI 5m strong");
-  }
-  if (side === "LONG" && rsi15 >= 54) {
-    score += 1.0;
-    reasons.push("RSI 15m strong");
-  }
-  if (side === "SHORT" && rsi5 <= 44) {
-    score += 1.0;
-    reasons.push("RSI 5m weak");
-  }
-  if (side === "SHORT" && rsi15 <= 46) {
-    score += 1.0;
-    reasons.push("RSI 15m weak");
-  }
-
-  if (side === "LONG" && mom5 > 0.10) {
-    score += 0.75;
-    reasons.push("5m momentum positive");
-  }
-  if (side === "LONG" && mom15 > 0.20) {
-    score += 0.75;
-    reasons.push("15m momentum positive");
-  }
-  if (side === "SHORT" && mom5 < -0.10) {
-    score += 0.75;
-    reasons.push("5m momentum negative");
-  }
-  if (side === "SHORT" && mom15 < -0.20) {
-    score += 0.75;
-    reasons.push("15m momentum negative");
-  }
-
-  if (volumeBoost >= 1.15) {
-    score += 0.75;
-    reasons.push("Volume expansion");
-  }
-
-  return {
-    side,
-    score,
-    price: price5,
-    volumeBoost,
-    reasons
-  };
+function fmt(n) {
+  if (!Number.isFinite(n)) return "-";
+  if (Math.abs(n) >= 1000) return n.toFixed(2);
+  if (Math.abs(n) >= 1) return n.toFixed(4);
+  return n.toFixed(6);
 }
 
-function analyzeSniper(klines5m, trendSide) {
-  const closes = klines5m.map(x => x.close);
-  const highs = klines5m.map(x => x.high);
-  const lows = klines5m.map(x => x.low);
-  const opens = klines5m.map(x => x.open);
-  const volumes = klines5m.map(x => x.volume);
-
-  const lastClose = closes.at(-1);
-  const prevClose = closes.at(-2);
-  const lastOpen = opens.at(-1);
-  const lastHigh = highs.at(-1);
-  const lastLow = lows.at(-1);
-
-  const prevHigh = highs.at(-2);
-  const prevLow = lows.at(-2);
-  const lastVol = volumes.at(-1);
-  const avgVol = avg(volumes.slice(-11, -1));
-  const volBoost = avgVol > 0 ? lastVol / avgVol : 0;
-  const bodyPct = Math.abs((lastClose - lastOpen) / lastOpen) * 100;
-  const wickUp = Math.abs(lastHigh - Math.max(lastOpen, lastClose));
-  const wickDown = Math.abs(Math.min(lastOpen, lastClose) - lastLow);
-  const candleRange = lastHigh - lastLow || 1;
-  const atrVal = atr(klines5m, 14);
-
-  if (![lastClose, prevClose, lastOpen, prevHigh, prevLow, volBoost, bodyPct, candleRange, atrVal].every(isValidNumber)) {
-    return null;
-  }
-
-  let side = "NONE";
-  let score = 0;
-  const reasons = [];
-
-  const bullishReclaim = lastLow < prevLow && lastClose > prevClose && lastClose > lastOpen;
-  const bearishReclaim = lastHigh > prevHigh && lastClose < prevClose && lastClose < lastOpen;
-
-  if (trendSide === "LONG" && bullishReclaim) {
-    side = "LONG";
-    score += 2.25;
-    reasons.push("Liquidity sweep reclaim long");
-  }
-
-  if (trendSide === "SHORT" && bearishReclaim) {
-    side = "SHORT";
-    score += 2.25;
-    reasons.push("Liquidity sweep reclaim short");
-  }
-
-  if (trendSide === "LONG" && side === "LONG" && bodyPct >= 0.18) {
-    score += 0.75;
-    reasons.push("Strong bullish body");
-  }
-
-  if (trendSide === "SHORT" && side === "SHORT" && bodyPct >= 0.18) {
-    score += 0.75;
-    reasons.push("Strong bearish body");
-  }
-
-  if (volBoost >= 1.20) {
-    score += 0.75;
-    reasons.push("Sniper volume confirmation");
-  }
-
-  if (atrVal > 0) {
-    const moveVsAtr = Math.abs(lastClose - prevClose) / atrVal;
-    if (moveVsAtr >= 0.20) {
-      score += 0.5;
-      reasons.push("Impulse vs ATR");
-    }
-  }
-
-  if (side === "LONG" && wickDown / candleRange > 0.35) {
-    score += 0.5;
-    reasons.push("Long lower wick reclaim");
-  }
-
-  if (side === "SHORT" && wickUp / candleRange > 0.35) {
-    score += 0.5;
-    reasons.push("Short upper wick reclaim");
-  }
-
-  return {
-    side,
-    score,
-    reasons
-  };
-}
-
-function combineSignals(trend, sniper) {
-  if (!trend || trend.side === "NONE") return null;
-
-  let side = trend.side;
-  let score = trend.score;
-  let mode = "TREND";
-  const reasons = [...(trend.reasons || [])];
-
-  if (sniper && sniper.side === trend.side && sniper.side !== "NONE") {
-    score += sniper.score + 0.75;
-    mode = "TREND + SNIPER";
-    reasons.push(...(sniper.reasons || []));
-    reasons.push("Trend/Sniper alignment");
-  } else if (sniper && sniper.side !== "NONE" && sniper.side !== trend.side) {
-    score -= 2.0;
-    mode = "CONFLICT";
-    reasons.push("Sniper conflict");
-  }
-
-  return {
-    side,
-    score,
-    mode,
-    price: trend.price,
-    reasons
-  };
-}
-
-// ---------- TRADE PLAN ----------
-function buildTradePlan(side, entry, klines5m) {
-  const atrVal = atr(klines5m, 14);
-  if (!isValidNumber(entry) || !isValidNumber(atrVal)) return null;
-
-  let stop, tp1, tp2;
-
-  if (side === "LONG") {
-    stop = entry - atrVal * 0.9;
-    tp1 = entry + atrVal * 0.9;
-    tp2 = entry + atrVal * 1.8;
-  } else {
-    stop = entry + atrVal * 0.9;
-    tp1 = entry - atrVal * 0.9;
-    tp2 = entry - atrVal * 1.8;
-  }
-
+function rr(entry, stop, tp2) {
   const risk = Math.abs(entry - stop);
-  const reward = Math.abs(tp1 - entry);
-  const rr = risk > 0 ? reward / risk : 0;
-
-  return {
-    entry: round(entry, 4),
-    stop: round(stop, 4),
-    tp1: round(tp1, 4),
-    tp2: round(tp2, 4),
-    rr: round(rr, 2)
-  };
+  const reward = Math.abs(tp2 - entry);
+  if (risk <= 0) return 0;
+  return reward / risk;
 }
 
-// ---------- DEDUPE ----------
-function shouldSkipSignal(symbol, side) {
-  const key = `${symbol}_${side}`;
-  const lastTs = lastSignalMap.get(key);
-  if (!lastTs) return false;
-  return (Date.now() - lastTs) < SIGNAL_COOLDOWN_MS;
+function clampScore(n) {
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(10, n));
 }
 
-function markSignal(symbol, side) {
-  lastSignalMap.set(`${symbol}_${side}`, Date.now());
+function shouldSkipDuplicate(signalKey) {
+  const ts = lastSignalAt.get(signalKey);
+  if (!ts) return false;
+  return (Date.now() - ts) < DUPLICATE_TTL_MS;
 }
 
-// ---------- SYMBOL RESOLUTION ----------
-async function resolveSymbols() {
-  if (RAW_ALLOWLIST && RAW_ALLOWLIST.trim().length > 0) {
-    const manual = RAW_ALLOWLIST.split(",")
-      .map(x => x.trim().toUpperCase())
-      .filter(Boolean)
-      .map(symbol => ({
-        symbol,
-        instId: `${symbol.replace("USDT", "")}-USDT-SWAP`
-      }));
-
-    console.log(`✅ Using manual allowlist: ${manual.length}`);
-    return manual;
-  }
-
-  const discovered = await getAllSymbols();
-  return discovered;
+function markSignal(signalKey) {
+  lastSignalAt.set(signalKey, Date.now());
 }
 
-// ---------- ANALYZE ONE SYMBOL ----------
-async function analyzeOne(item) {
-  const { symbol, instId } = item;
+async function getBTCBias() {
+  const [trendData, htfData] = await Promise.all([
+    fetchKlines("BTCUSDT", TREND_TF, 80),
+    fetchKlines("BTCUSDT", HTF, 80),
+  ]);
 
+  if (!trendData || !htfData) return { bias: "MIX", momentum: 0 };
+
+  const cTrend = closes(trendData);
+  const cHtf = closes(htfData);
+
+  const ema20Trend = ema(cTrend, 20);
+  const ema50Trend = ema(cTrend, 50);
+  const ema20Htf = ema(cHtf, 20);
+  const ema50Htf = ema(cHtf, 50);
+
+  const trendLong = ema20Trend.at(-1) > ema50Trend.at(-1);
+  const trendShort = ema20Trend.at(-1) < ema50Trend.at(-1);
+  const htfLong = ema20Htf.at(-1) > ema50Htf.at(-1);
+  const htfShort = ema20Htf.at(-1) < ema50Htf.at(-1);
+
+  let bias = "MIX";
+  if (trendLong && htfLong) bias = "LONG";
+  if (trendShort && htfShort) bias = "SHORT";
+
+  const momentum = Math.abs(pctMove(cTrend.at(-10), cTrend.at(-1)));
+  return { bias, momentum };
+}
+
+async function checkSniper(symbol, btc) {
   try {
-    console.log(`➡️ Checking ${symbol}`);
-
-    const [klines5m, klines15m] = await Promise.all([
-      getKlines(instId, "5m", 150),
-      getKlines(instId, "15m", 150)
+    const [entryData, trendData, htfData] = await Promise.all([
+      fetchKlines(symbol, ENTRY_TF, 120),
+      fetchKlines(symbol, TREND_TF, 120),
+      fetchKlines(symbol, HTF, 120),
     ]);
 
-    if (!klines5m || !klines15m) {
-      console.log(`⚠️ Missing klines: ${symbol}`);
-      return null;
+    if (!entryData || !trendData || !htfData) return null;
+    if (btc.bias === "MIX" || btc.momentum < 0.10) return null;
+
+    const c = closes(entryData);
+    const o = opens(entryData);
+    const h = highs(entryData);
+    const l = lows(entryData);
+    const v = volumes(entryData);
+
+    const cTrend = closes(trendData);
+    const cHtf = closes(htfData);
+
+    const ema20Entry = ema(c, 20);
+    const ema20Trend = ema(cTrend, 20);
+    const ema50Trend = ema(cTrend, 50);
+    const ema20Htf = ema(cHtf, 20);
+    const ema50Htf = ema(cHtf, 50);
+
+    const atr = atrFromKlines(entryData, 14);
+    if (!atr) return null;
+
+    const last = c.at(-1);
+    const prev = c.at(-2);
+    const prev2 = c.at(-3);
+
+    const pOpen = o.at(-2);
+    const pHigh = h.at(-2);
+    const pLow = l.at(-2);
+    const ppHigh = h.at(-3);
+    const ppLow = l.at(-3);
+
+    const avgVolNow = avg(v.slice(-20, -1));
+    const volNow = v.at(-1);
+    const volumeSpike = volNow > avgVolNow * 1.25;
+    if (!volumeSpike) return null;
+
+    const trendLong = ema20Trend.at(-1) > ema50Trend.at(-1) && ema20Htf.at(-1) > ema50Htf.at(-1);
+    const trendShort = ema20Trend.at(-1) < ema50Trend.at(-1) && ema20Htf.at(-1) < ema50Htf.at(-1);
+
+    const recentHigh = Math.max(...h.slice(-10, -3));
+    const recentLow = Math.min(...l.slice(-10, -3));
+
+    const sweepLong = ppLow < recentLow && prev > recentLow;
+    const sweepShort = ppHigh > recentHigh && prev < recentHigh;
+
+    const prevRange = Math.max(pHigh - pLow, 0.0000001);
+    const prevBody = Math.abs(prev - pOpen);
+    const prevUpper = pHigh - Math.max(pOpen, prev);
+    const prevLower = Math.min(pOpen, prev) - pLow;
+    const prevBodyRatio = prevBody / prevRange;
+
+    const antiWickLong = prevUpper <= prevRange * 0.30;
+    const antiWickShort = prevLower <= prevRange * 0.30;
+
+    const confirmLong = prev > pOpen && prevBodyRatio >= 0.45 && antiWickLong;
+    const confirmShort = prev < pOpen && prevBodyRatio >= 0.45 && antiWickShort;
+
+    const reclaimLong = prev > recentLow && prev > ema20Entry.at(-2);
+    const reclaimShort = prev < recentHigh && prev < ema20Entry.at(-2);
+
+    const plannedLongEntry = Math.min(last, prev - atr * 0.05);
+    const plannedShortEntry = Math.max(last, prev + atr * 0.05);
+
+    const longContinuation = l.at(-1) > pLow && last > prev && last >= plannedLongEntry;
+    const shortContinuation = h.at(-1) < pHigh && last < prev && last <= plannedShortEntry;
+
+    const nearEmaLong = Math.abs(plannedLongEntry - ema20Entry.at(-1)) / plannedLongEntry * 100 <= 0.45;
+    const nearEmaShort = Math.abs(plannedShortEntry - ema20Entry.at(-1)) / plannedShortEntry * 100 <= 0.45;
+
+    const rsi = calcRSI(c, 14).at(-1);
+    const reactionLong = Math.abs(prev - recentLow) / atr;
+    const reactionShort = Math.abs(recentHigh - prev) / atr;
+    const displacement = Math.abs(prev - prev2);
+
+    if (Math.abs(prev - prev2) < atr * 0.7) return null;
+
+    let longScore = 0;
+    longScore += trendLong ? 2.5 : 0;
+    longScore += btc.bias === "LONG" ? 1.5 : 0;
+    longScore += sweepLong ? 1.5 : 0;
+    longScore += reclaimLong ? 1.0 : 0;
+    longScore += confirmLong ? 1.0 : 0;
+    longScore += nearEmaLong ? 0.8 : 0;
+    longScore += volumeSpike ? 0.8 : 0;
+    longScore += (rsi >= 42 && rsi <= 62) ? 0.5 : 0;
+    longScore += reactionLong >= 1.0 ? 0.7 : 0;
+    longScore += displacement >= atr * 0.8 ? 0.7 : 0;
+
+    let shortScore = 0;
+    shortScore += trendShort ? 2.5 : 0;
+    shortScore += btc.bias === "SHORT" ? 1.5 : 0;
+    shortScore += sweepShort ? 1.5 : 0;
+    shortScore += reclaimShort ? 1.0 : 0;
+    shortScore += confirmShort ? 1.0 : 0;
+    shortScore += nearEmaShort ? 0.8 : 0;
+    shortScore += volumeSpike ? 0.8 : 0;
+    shortScore += (rsi >= 38 && rsi <= 58) ? 0.5 : 0;
+    shortScore += reactionShort >= 1.0 ? 0.7 : 0;
+    shortScore += displacement >= atr * 0.8 ? 0.7 : 0;
+
+    longScore = clampScore(longScore);
+    shortScore = clampScore(shortScore);
+
+    if (
+      longScore >= MIN_SCORE_SNIPER &&
+      trendLong &&
+      btc.bias === "LONG" &&
+      sweepLong &&
+      reclaimLong &&
+      confirmLong &&
+      nearEmaLong &&
+      longContinuation &&
+      (rsi >= 42 && rsi <= 62) &&
+      reactionLong >= 1.0 &&
+      displacement >= atr * 0.8
+    ) {
+      const stop = Math.min(ppLow, recentLow) - atr * 0.65;
+      const tp1 = plannedLongEntry + (plannedLongEntry - stop) * 1.2;
+      const tp2 = plannedLongEntry + (plannedLongEntry - stop) * 2.0;
+      const tradeRR = rr(plannedLongEntry, stop, tp2);
+      if (tradeRR < MIN_RR_SNIPER) return null;
+
+      return {
+        mode: "SNIPER",
+        coin: symbol,
+        side: "LONG",
+        score: longScore,
+        entry: plannedLongEntry,
+        stop,
+        tp1,
+        tp2,
+        rr: tradeRR
+      };
     }
 
-    const trend = analyzeTrend(klines5m, klines15m);
-    if (!trend || trend.side === "NONE") {
-      return null;
+    if (
+      shortScore >= MIN_SCORE_SNIPER &&
+      trendShort &&
+      btc.bias === "SHORT" &&
+      sweepShort &&
+      reclaimShort &&
+      confirmShort &&
+      nearEmaShort &&
+      shortContinuation &&
+      (rsi >= 38 && rsi <= 58) &&
+      reactionShort >= 1.0 &&
+      displacement >= atr * 0.8
+    ) {
+      const stop = Math.max(ppHigh, recentHigh) + atr * 0.65;
+      const tp1 = plannedShortEntry - (stop - plannedShortEntry) * 1.2;
+      const tp2 = plannedShortEntry - (stop - plannedShortEntry) * 2.0;
+      const tradeRR = rr(plannedShortEntry, stop, tp2);
+      if (tradeRR < MIN_RR_SNIPER) return null;
+
+      return {
+        mode: "SNIPER",
+        coin: symbol,
+        side: "SHORT",
+        score: shortScore,
+        entry: plannedShortEntry,
+        stop,
+        tp1,
+        tp2,
+        rr: tradeRR
+      };
     }
 
-    const sniper = analyzeSniper(klines5m, trend.side);
-    const combined = combineSignals(trend, sniper);
-
-    if (!combined) return null;
-    if (combined.mode === "CONFLICT") return null;
-    if (combined.score < MIN_SCORE) return null;
-    if (shouldSkipSignal(symbol, combined.side)) return null;
-
-    const plan = buildTradePlan(combined.side, combined.price, klines5m);
-    if (!plan) return null;
-    if (plan.rr < 1.0) return null;
-
-    return {
-      symbol,
-      side: combined.side,
-      mode: combined.mode,
-      score: round(combined.score, 1),
-      entry: plan.entry,
-      stop: plan.stop,
-      tp1: plan.tp1,
-      tp2: plan.tp2,
-      rr: plan.rr
-    };
-  } catch (err) {
-    console.log(`❌ Analyze failed for ${symbol}:`, err.message);
+    return null;
+  } catch {
     return null;
   }
 }
 
-// ---------- MAIN SCAN ----------
-async function scan() {
-  console.log("🔍 SCAN START");
+async function checkTrend(symbol, btc) {
+  try {
+    const [entryData, trendData, htfData] = await Promise.all([
+      fetchKlines(symbol, ENTRY_TF, 80),
+      fetchKlines(symbol, TREND_TF, 80),
+      fetchKlines(symbol, HTF, 80)
+    ]);
 
-  if (!runtimeSymbols.length) {
-    runtimeSymbols = await resolveSymbols();
-    console.log(`📦 Runtime symbols loaded: ${runtimeSymbols.length}`);
-  }
+    if (!entryData || !trendData || !htfData) return null;
+    if (btc.bias === "MIX" || btc.momentum < 0.10) return null;
 
-  let sentCount = 0;
-  const batches = chunkArray(runtimeSymbols, SYMBOL_BATCH_SIZE);
+    const c = closes(entryData);
+    const o = opens(entryData);
+    const h = highs(entryData);
+    const l = lows(entryData);
+    const v = volumes(entryData);
 
-  for (const batch of batches) {
-    if (sentCount >= MAX_ALERTS_PER_SCAN) break;
+    const cTrend = closes(trendData);
+    const cHtf = closes(htfData);
 
-    const results = await Promise.all(batch.map(analyzeOne));
+    const ema20Entry = ema(c, 20);
+    const ema20Trend = ema(cTrend, 20);
+    const ema50Trend = ema(cTrend, 50);
+    const ema20Htf = ema(cHtf, 20);
+    const ema50Htf = ema(cHtf, 50);
 
-    for (const signal of results) {
-      if (!signal) continue;
-      if (sentCount >= MAX_ALERTS_PER_SCAN) break;
+    const last = c.at(-1);
+    const lastOpen = o.at(-1);
+    const lastHigh = h.at(-1);
+    const lastLow = l.at(-1);
 
-      const msg =
-`🔥 ${signal.symbol}
-Mode: ${signal.mode}
-Side: ${signal.side}
-Score: ${signal.score}/10
+    const prevHigh5 = Math.max(...h.slice(-6, -1));
+    const prevLow5 = Math.min(...l.slice(-6, -1));
 
-Entry: ${signal.entry}
-Stop: ${signal.stop}
-TP1: ${signal.tp1}
-TP2: ${signal.tp2}
-RR: ${signal.rr}
+    const volNow = v.at(-1);
+    const avgVolNow = avg(v.slice(-20, -1));
+    const volumeSpike = volNow > avgVolNow * 1.3;
+    if (!volumeSpike) return null;
 
-Decision: ENTER`;
+    const trendLong = ema20Trend.at(-1) > ema50Trend.at(-1) && ema20Htf.at(-1) > ema50Htf.at(-1);
+    const trendShort = ema20Trend.at(-1) < ema50Trend.at(-1) && ema20Htf.at(-1) < ema50Htf.at(-1);
 
-      await sendTelegram(msg);
-      markSignal(signal.symbol, signal.side);
-      console.log(`✅ SIGNAL SENT: ${signal.symbol} ${signal.side} score=${signal.score}`);
-      sentCount++;
-      await sleep(400);
+    const momentum = pctMove(c.at(-4), last);
+    const nearEma = Math.abs(last - ema20Entry.at(-1)) / last < 0.015;
+
+    const candleBody = Math.abs(last - lastOpen);
+    const candleRange = Math.max(lastHigh - lastLow, 0.0000001);
+    const upperWick = lastHigh - Math.max(last, lastOpen);
+    const lowerWick = Math.min(last, lastOpen) - lastLow;
+
+    let longScore = 0;
+    let shortScore = 0;
+
+    if (btc.bias === "LONG" && trendLong && last > prevHigh5) longScore += 4;
+    if (btc.bias === "SHORT" && trendShort && last < prevLow5) shortScore += 4;
+
+    if (volumeSpike) {
+      longScore += 1.5;
+      shortScore += 1.5;
     }
 
-    await sleep(BATCH_DELAY_MS);
+    if (momentum > 0.18) longScore += 1.0;
+    if (momentum < -0.18) shortScore += 1.0;
+
+    if (nearEma) {
+      longScore += 1.0;
+      shortScore += 1.0;
+    }
+
+    if (candleBody > candleRange * 0.50) {
+      longScore += 1.0;
+      shortScore += 1.0;
+    }
+
+    if (upperWick < candleRange * 0.30) longScore += 0.5;
+    if (lowerWick < candleRange * 0.30) shortScore += 0.5;
+
+    longScore = clampScore(longScore);
+    shortScore = clampScore(shortScore);
+
+    if (longScore >= MIN_SCORE_TREND) {
+      const stop = prevLow5;
+      const tp1 = last + Math.abs(last - stop) * 1.0;
+      const tp2 = last + Math.abs(last - stop) * 1.8;
+      const tradeRR = rr(last, stop, tp2);
+      if (tradeRR < MIN_RR_TREND) return null;
+
+      return {
+        mode: "TREND",
+        coin: symbol,
+        side: "LONG",
+        score: longScore,
+        entry: last,
+        stop,
+        tp1,
+        tp2,
+        rr: tradeRR
+      };
+    }
+
+    if (shortScore >= MIN_SCORE_TREND) {
+      const stop = prevHigh5;
+      const tp1 = last - Math.abs(stop - last) * 1.0;
+      const tp2 = last - Math.abs(stop - last) * 1.8;
+      const tradeRR = rr(last, stop, tp2);
+      if (tradeRR < MIN_RR_TREND) return null;
+
+      return {
+        mode: "TREND",
+        coin: symbol,
+        side: "SHORT",
+        score: shortScore,
+        entry: last,
+        stop,
+        tp1,
+        tp2,
+        rr: tradeRR
+      };
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function formatSignal(sig, btc) {
+  const sizeNote = sig.mode === "TREND" ? "TREND = KÜÇÜK BOY" : "SNIPER = ANA SETUP";
+  return `🔥 ${sig.mode} SIGNAL
+
+Coin: ${sig.coin}
+Side: ${sig.side}
+Confidence: ${sig.score.toFixed(1)}/10
+
+Entry: ${fmt(sig.entry)}
+Stop: ${fmt(sig.stop)}
+TP1: ${fmt(sig.tp1)}
+TP2: ${fmt(sig.tp2)}
+RR: ${sig.rr.toFixed(2)}
+
+BTC Bias: ${btc.bias}
+BTC Mom: ${btc.momentum.toFixed(2)}%
+
+${sizeNote}`;
+}
+
+function formatExit(trade, price, state, reason) {
+  return `🔴 SMART EXIT
+
+Type: ${trade.mode}
+Coin: ${trade.coin}
+Side: ${trade.side}
+State: ${state}
+
+Entry: ${fmt(trade.entry)}
+Live: ${fmt(price)}
+Stop: ${fmt(trade.stop)}
+TP1: ${fmt(trade.tp1)}
+TP2: ${fmt(trade.tp2)}
+
+Reason: ${reason}`;
+}
+
+async function sendTelegram(msg) {
+  if (!TG_TOKEN || !CHAT_ID) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: CHAT_ID,
+        text: msg
+      })
+    });
+  } catch {}
+}
+
+async function updateActiveTrade() {
+  if (!activeTrade) return;
+
+  const price = await fetchPrice(activeTrade.coin);
+  if (!price) return;
+
+  let state = "HOLD";
+  let reason = "No decisive weakness.";
+
+  if (activeTrade.side === "LONG") {
+    if (!activeTrade.tp1Hit && price >= activeTrade.tp1) {
+      activeTrade.tp1Hit = true;
+      activeTrade.stop = activeTrade.entry;
+      state = "CONTINUE";
+      reason = "TP1 reached, stop moved to BE.";
+    } else if (price <= activeTrade.stop) {
+      state = "EXIT";
+      reason = "Stop reached.";
+    } else if (price >= activeTrade.tp2) {
+      state = "EXIT";
+      reason = "TP2 reached.";
+    }
+  } else {
+    if (!activeTrade.tp1Hit && price <= activeTrade.tp1) {
+      activeTrade.tp1Hit = true;
+      activeTrade.stop = activeTrade.entry;
+      state = "CONTINUE";
+      reason = "TP1 reached, stop moved to BE.";
+    } else if (price >= activeTrade.stop) {
+      state = "EXIT";
+      reason = "Stop reached.";
+    } else if (price <= activeTrade.tp2) {
+      state = "EXIT";
+      reason = "TP2 reached.";
+    }
   }
 
-  console.log("✅ SCAN END");
+  if (state !== "HOLD") {
+    await sendTelegram(formatExit(activeTrade, price, state, reason));
+  }
+
+  if (state === "EXIT") {
+    activeTrade = null;
+  }
 }
 
-// ---------- START ----------
-async function start() {
-  runtimeSymbols = await resolveSymbols();
-  await sendTelegram(`🚀 BOT LIVE | SYMBOLS: ${runtimeSymbols.length} | MODE: ELITE TREND + SNIPER | SOURCE: OKX`);
-  await scan();
-  setInterval(scan, SCAN_INTERVAL_MS);
+async function run() {
+  if (!COINS.length) return;
+
+  await updateActiveTrade();
+
+  // aktif trade varken yeni trade açma
+  if (activeTrade) return;
+
+  const btc = await getBTCBias();
+  if (btc.bias === "MIX" || btc.momentum < 0.10) return;
+
+  let bestSniper = null;
+  let bestTrend = null;
+
+  for (const coin of COINS) {
+    if (badSymbols.has(coin)) continue;
+
+    const sniper = await checkSniper(coin, btc);
+    if (sniper && (!bestSniper || sniper.score > bestSniper.score || (sniper.score === bestSniper.score && sniper.rr > bestSniper.rr))) {
+      bestSniper = sniper;
+    }
+
+    const trend = await checkTrend(coin, btc);
+    if (trend && (!bestTrend || trend.score > bestTrend.score || (trend.score === bestTrend.score && trend.rr > bestTrend.rr))) {
+      bestTrend = trend;
+    }
+  }
+
+  const best = bestSniper || bestTrend;
+  if (!best) return;
+
+  const signalKey = `${best.mode}:${best.coin}:${best.side}`;
+  if (shouldSkipDuplicate(signalKey)) return;
+
+  markSignal(signalKey);
+  await sendTelegram(formatSignal(best, btc));
+
+  activeTrade = {
+    ...best,
+    tp1Hit: false,
+    createdAt: Date.now()
+  };
 }
 
-start();
+async function main() {
+  if (!TG_TOKEN || !CHAT_ID || !COINS.length) {
+    console.log("Missing TG_BOT_TOKEN / TG_CHAT_ID / COIN_LIST");
+    process.exit(1);
+  }
+
+  while (true) {
+    await run();
+    await new Promise(resolve => setTimeout(resolve, LOOP_MS));
+  }
+}
+
+main().catch(err => {
+  console.error("FATAL ERROR:", err);
+  process.exit(1);
+});
