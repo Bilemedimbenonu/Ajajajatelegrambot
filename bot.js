@@ -11,8 +11,8 @@ const MIN_SCORE_TREND = parseFloat(process.env.MIN_SCORE_TREND || "6.5");
 const MIN_RR_SNIPER = parseFloat(process.env.MIN_RR_SNIPER || "2.0");
 const MIN_RR_TREND = parseFloat(process.env.MIN_RR_TREND || "1.8");
 
-const LOOP_MS = parseInt(process.env.LOOP_MS || "60000", 10);
-const DUPLICATE_TTL_MS = parseInt(process.env.DUPLICATE_TTL_MS || "2700000", 10); // 45 dk
+const LOOP_MS = parseInt(process.env.LOOP_MS || "90000", 10);
+const DUPLICATE_TTL_MS = parseInt(process.env.DUPLICATE_TTL_MS || "2700000", 10);
 
 const BASE_URLS = [
   "https://fapi1.binance.com",
@@ -20,7 +20,7 @@ const BASE_URLS = [
   "https://fapi3.binance.com"
 ];
 
-const COINS = (process.env.COIN_LIST || "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,DOTUSDT,ATOMUSDT,INJUSDT,NEARUSDT,APTUSDT,OPUSDT,ARBUSDT,SEIUSDT,SUIUSDT,LTCUSDT,BCHUSDT,FTMUSDT,ICPUSDT,STXUSDT,THETAUSDT,ALGOUSDT,VETUSDT,XLMUSDT,HBARUSDT,EGLDUSDT,AXSUSDT,SANDUSDT,MANAUSDT,GALAUSDT,APEUSDT,PEPEUSDT,FLOKIUSDT,BLURUSDT,ENSUSDT,CHZUSDT,CRVUSDT")
+const COINS = (process.env.COIN_LIST || "")
   .split(",")
   .map(s => s.trim().toUpperCase())
   .filter(Boolean);
@@ -28,18 +28,25 @@ const COINS = (process.env.COIN_LIST || "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT
 const lastSignalAt = new Map();
 const badSymbols = new Set();
 
-// Tek aktif trade mantığı
 let activeTrade = null;
 
 console.log("V8 STRICT BOT STARTED");
+console.log("ENTRY_TF:", ENTRY_TF, "TREND_TF:", TREND_TF, "HTF:", HTF);
+console.log("COIN COUNT:", COINS.length);
+console.log("MIN_SCORE_SNIPER:", MIN_SCORE_SNIPER, "MIN_SCORE_TREND:", MIN_SCORE_TREND);
+console.log("MIN_RR_SNIPER:", MIN_RR_SNIPER, "MIN_RR_TREND:", MIN_RR_TREND);
+console.log("LOOP_MS:", LOOP_MS, "DUPLICATE_TTL_MS:", DUPLICATE_TTL_MS);
 
 async function fetchTextWithRetry(path) {
   for (const base of BASE_URLS) {
     try {
-      const res = await fetch(base + path);
+      const url = base + path;
+      const res = await fetch(url);
       if (!res.ok) continue;
       return await res.text();
-    } catch {}
+    } catch (e) {
+      // sessiz geç
+    }
   }
   return null;
 }
@@ -56,11 +63,14 @@ async function fetchJsonWithRetry(path) {
 
 async function fetchKlines(symbol, interval = "5m", limit = 120) {
   if (badSymbols.has(symbol)) return null;
+
   const data = await fetchJsonWithRetry(`/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+
   if (!Array.isArray(data) || data.length < 10 || !Array.isArray(data[0])) {
     badSymbols.add(symbol);
     return null;
   }
+
   return data;
 }
 
@@ -88,10 +98,12 @@ function ema(values, period) {
   const k = 2 / (period + 1);
   let prev = values[0];
   const out = [prev];
+
   for (let i = 1; i < values.length; i++) {
     prev = values[i] * k + prev * (1 - k);
     out.push(prev);
   }
+
   return out;
 }
 
@@ -105,6 +117,7 @@ function calcRSI(closesArr, period = 14) {
 
   let gains = 0;
   let losses = 0;
+
   for (let i = 1; i <= period; i++) {
     const d = closesArr[i] - closesArr[i - 1];
     if (d >= 0) gains += d;
@@ -152,6 +165,7 @@ function atrFromKlines(klines, period = 14) {
   for (let i = period; i < trs.length; i++) {
     atr = ((atr * (period - 1)) + trs[i]) / period;
   }
+
   return atr;
 }
 
@@ -190,7 +204,10 @@ async function getBTCBias() {
     fetchKlines("BTCUSDT", HTF, 80),
   ]);
 
-  if (!trendData || !htfData) return { bias: "MIX", momentum: 0 };
+  if (!trendData || !htfData) {
+    console.log("BTC BIAS FAILED");
+    return { bias: "MIX", momentum: 0 };
+  }
 
   const cTrend = closes(trendData);
   const cHtf = closes(htfData);
@@ -389,7 +406,8 @@ async function checkSniper(symbol, btc) {
     }
 
     return null;
-  } catch {
+  } catch (e) {
+    console.log("SNIPER ERROR:", symbol, e?.message || e);
     return null;
   }
 }
@@ -515,13 +533,14 @@ async function checkTrend(symbol, btc) {
     }
 
     return null;
-  } catch {
+  } catch (e) {
+    console.log("TREND ERROR:", symbol, e?.message || e);
     return null;
   }
 }
 
 function formatSignal(sig, btc) {
-  const sizeNote = sig.mode === "TREND" ? "TREND = KÜÇÜK BOY" : "SNIPER = ANA SETUP";
+  const sizeNote = sig.mode === "TREND" ? "TREND = KUCUK BOY" : "SNIPER = ANA SETUP";
   return `🔥 ${sig.mode} SIGNAL
 
 Coin: ${sig.coin}
@@ -558,9 +577,13 @@ Reason: ${reason}`;
 }
 
 async function sendTelegram(msg) {
-  if (!TG_TOKEN || !CHAT_ID) return;
+  if (!TG_TOKEN || !CHAT_ID) {
+    console.log("TELEGRAM ENV MISSING");
+    return false;
+  }
+
   try {
-    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -568,14 +591,29 @@ async function sendTelegram(msg) {
         text: msg
       })
     });
-  } catch {}
+
+    const text = await res.text();
+    console.log("TELEGRAM RESPONSE:", text);
+    return res.ok;
+  } catch (e) {
+    console.log("TELEGRAM ERROR:", e?.message || e);
+    return false;
+  }
 }
 
 async function updateActiveTrade() {
-  if (!activeTrade) return;
+  if (!activeTrade) {
+    console.log("NO ACTIVE TRADE");
+    return;
+  }
+
+  console.log("ACTIVE TRADE CHECK:", activeTrade.coin, activeTrade.side);
 
   const price = await fetchPrice(activeTrade.coin);
-  if (!price) return;
+  if (!price) {
+    console.log("ACTIVE TRADE PRICE FAILED");
+    return;
+  }
 
   let state = "HOLD";
   let reason = "No decisive weakness.";
@@ -609,24 +647,38 @@ async function updateActiveTrade() {
   }
 
   if (state !== "HOLD") {
+    console.log("ACTIVE TRADE UPDATE:", state, reason);
     await sendTelegram(formatExit(activeTrade, price, state, reason));
   }
 
   if (state === "EXIT") {
+    console.log("ACTIVE TRADE CLOSED");
     activeTrade = null;
   }
 }
 
 async function run() {
-  if (!COINS.length) return;
+  console.log("RUN CALISTI");
+
+  if (!COINS.length) {
+    console.log("COIN_LIST EMPTY");
+    return;
+  }
 
   await updateActiveTrade();
 
-  // aktif trade varken yeni trade açma
-  if (activeTrade) return;
+  if (activeTrade) {
+    console.log("ACTIVE TRADE EXISTS, NEW SIGNAL SKIPPED");
+    return;
+  }
 
   const btc = await getBTCBias();
-  if (btc.bias === "MIX" || btc.momentum < 0.10) return;
+  console.log("BTC:", btc);
+
+  if (btc.bias === "MIX" || btc.momentum < 0.10) {
+    console.log("BTC FILTER BLOCKED");
+    return;
+  }
 
   let bestSniper = null;
   let bestTrend = null;
@@ -645,30 +697,56 @@ async function run() {
     }
   }
 
+  console.log("BEST SNIPER:", bestSniper ? `${bestSniper.coin} ${bestSniper.score}/10 RR:${bestSniper.rr.toFixed(2)}` : "NONE");
+  console.log("BEST TREND:", bestTrend ? `${bestTrend.coin} ${bestTrend.score}/10 RR:${bestTrend.rr.toFixed(2)}` : "NONE");
+
   const best = bestSniper || bestTrend;
-  if (!best) return;
+  if (!best) {
+    console.log("NO SIGNAL FOUND");
+    return;
+  }
 
   const signalKey = `${best.mode}:${best.coin}:${best.side}`;
-  if (shouldSkipDuplicate(signalKey)) return;
+  if (shouldSkipDuplicate(signalKey)) {
+    console.log("DUPLICATE SKIPPED:", signalKey);
+    return;
+  }
 
   markSignal(signalKey);
-  await sendTelegram(formatSignal(best, btc));
+
+  console.log("SENDING SIGNAL:", best.mode, best.coin, best.side, "RR:", best.rr.toFixed(2), "CONF:", best.score.toFixed(1));
+
+  const sent = await sendTelegram(formatSignal(best, btc));
+  if (!sent) {
+    console.log("SIGNAL SEND FAILED");
+    return;
+  }
 
   activeTrade = {
     ...best,
     tp1Hit: false,
     createdAt: Date.now()
   };
+
+  console.log("ACTIVE TRADE OPENED:", activeTrade.coin, activeTrade.side);
 }
 
 async function main() {
+  console.log("MAIN LOOP BASLADI");
+
   if (!TG_TOKEN || !CHAT_ID || !COINS.length) {
     console.log("Missing TG_BOT_TOKEN / TG_CHAT_ID / COIN_LIST");
     process.exit(1);
   }
 
   while (true) {
-    await run();
+    try {
+      await run();
+    } catch (e) {
+      console.log("RUN ERROR:", e?.message || e);
+    }
+
+    console.log("SLEEPING FOR", LOOP_MS, "ms");
     await new Promise(resolve => setTimeout(resolve, LOOP_MS));
   }
 }
