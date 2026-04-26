@@ -5,11 +5,11 @@ const ENTRY_TF = process.env.ENTRY_TF || "5m";
 const TREND_TF = process.env.TREND_TF || "15m";
 const HTF = process.env.HTF || "1h";
 
-const MIN_SCORE_SNIPER = parseFloat(process.env.MIN_SCORE_SNIPER || "7.5");
-const MIN_SCORE_TREND = parseFloat(process.env.MIN_SCORE_TREND || "6.5");
+const MIN_SCORE_SNIPER = parseFloat(process.env.MIN_SCORE_SNIPER || "6.5");
+const MIN_SCORE_TREND = parseFloat(process.env.MIN_SCORE_TREND || "5.5");
 
-const MIN_RR_SNIPER = parseFloat(process.env.MIN_RR_SNIPER || "2.0");
-const MIN_RR_TREND = parseFloat(process.env.MIN_RR_TREND || "1.8");
+const MIN_RR_SNIPER = parseFloat(process.env.MIN_RR_SNIPER || "1.7");
+const MIN_RR_TREND = parseFloat(process.env.MIN_RR_TREND || "1.4");
 
 const LOOP_MS = parseInt(process.env.LOOP_MS || "90000", 10);
 const DUPLICATE_TTL_MS = parseInt(process.env.DUPLICATE_TTL_MS || "2700000", 10);
@@ -30,675 +30,216 @@ const badSymbols = new Set();
 
 let activeTrade = null;
 
-console.log("V8 NO-BTC-FILTER BOT STARTED");
+console.log("V8 BALANCED BOT STARTED");
 console.log("COIN COUNT:", COINS.length);
 
-async function fetchTextWithRetry(path) {
+async function fetchJson(path) {
   for (const base of BASE_URLS) {
     try {
       const res = await fetch(base + path);
       if (!res.ok) continue;
-      return await res.text();
+      return await res.json();
     } catch {}
   }
   return null;
 }
 
-async function fetchJsonWithRetry(path) {
-  const text = await fetchTextWithRetry(path);
-  if (!text) return null;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-async function fetchKlines(symbol, interval = "5m", limit = 120) {
+async function fetchKlines(symbol, tf) {
   if (badSymbols.has(symbol)) return null;
-
-  const data = await fetchJsonWithRetry(`/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
-  if (!Array.isArray(data) || data.length < 10 || !Array.isArray(data[0])) {
+  const data = await fetchJson(`/fapi/v1/klines?symbol=${symbol}&interval=${tf}&limit=120`);
+  if (!Array.isArray(data)) {
     badSymbols.add(symbol);
     return null;
   }
   return data;
 }
 
-async function fetchPrice(symbol) {
-  if (badSymbols.has(symbol)) return null;
-  const data = await fetchJsonWithRetry(`/fapi/v1/ticker/price?symbol=${symbol}`);
-  if (!data) return null;
-  const p = parseFloat(data.price);
-  return Number.isFinite(p) ? p : null;
+function closes(d){return d.map(x=>+x[4])}
+function highs(d){return d.map(x=>+x[2])}
+function lows(d){return d.map(x=>+x[3])}
+function volumes(d){return d.map(x=>+x[5])}
+
+function ema(v,p){
+  let k=2/(p+1),r=[v[0]];
+  for(let i=1;i<v.length;i++) r.push(v[i]*k+r[i-1]*(1-k));
+  return r;
 }
 
-function closes(data) { return data.map(x => parseFloat(x[4])); }
-function opens(data) { return data.map(x => parseFloat(x[1])); }
-function highs(data) { return data.map(x => parseFloat(x[2])); }
-function lows(data) { return data.map(x => parseFloat(x[3])); }
-function volumes(data) { return data.map(x => parseFloat(x[5])); }
+function avg(a){return a.reduce((x,y)=>x+y,0)/a.length}
 
-function avg(arr) {
-  if (!arr?.length) return 0;
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
+function rr(e,s,tp){return Math.abs(tp-e)/Math.abs(e-s)}
+
+function clamp(n){return Math.max(0,Math.min(10,n))}
+
+function dup(k){
+  return lastSignalAt.get(k) && Date.now()-lastSignalAt.get(k)<DUPLICATE_TTL_MS
 }
 
-function ema(values, period) {
-  if (!values?.length) return [];
-  const k = 2 / (period + 1);
-  let prev = values[0];
-  const out = [prev];
-  for (let i = 1; i < values.length; i++) {
-    prev = values[i] * k + prev * (1 - k);
-    out.push(prev);
-  }
-  return out;
+function mark(k){lastSignalAt.set(k,Date.now())}
+
+async function checkSniper(sym){
+  const d = await fetchKlines(sym, ENTRY_TF);
+  if(!d) return null;
+
+  const c = closes(d);
+  const h = highs(d);
+  const l = lows(d);
+  const v = volumes(d);
+
+  const ema20 = ema(c,20);
+  const last = c.at(-1);
+  const prev = c.at(-2);
+
+  const avgVol = avg(v.slice(-20,-1));
+  const volNow = v.at(-1);
+
+  // 🔥 DENGELENMIS VOLUME
+  if(volNow < avgVol * 1.12) return null;
+
+  let score = 0;
+
+  if(last > ema20.at(-1)) score += 2;
+  if(prev < ema20.at(-2) && last > ema20.at(-1)) score += 2;
+
+  const range = Math.max(...h.slice(-10)) - Math.min(...l.slice(-10));
+  if(range > 0) score += 1;
+
+  score = clamp(score);
+
+  if(score < MIN_SCORE_SNIPER) return null;
+
+  const entry = last;
+  const stop = Math.min(...l.slice(-5));
+  const tp2 = entry + (entry - stop) * 1.8;
+
+  const R = rr(entry, stop, tp2);
+  if(R < MIN_RR_SNIPER) return null;
+
+  return {
+    mode:"SNIPER",
+    coin:sym,
+    side:"LONG",
+    score,
+    entry,
+    stop,
+    tp2,
+    rr:R
+  };
 }
 
-function pctMove(from, to) {
-  if (!Number.isFinite(from) || !Number.isFinite(to) || from === 0) return 0;
-  return ((to - from) / from) * 100;
+async function checkTrend(sym){
+  const d = await fetchKlines(sym, ENTRY_TF);
+  if(!d) return null;
+
+  const c = closes(d);
+  const v = volumes(d);
+
+  const last = c.at(-1);
+  const prev = c.at(-5);
+
+  const avgVol = avg(v.slice(-20,-1));
+  const volNow = v.at(-1);
+
+  // 🔥 DENGELENMIS VOLUME
+  if(volNow < avgVol * 1.15) return null;
+
+  let score = 0;
+
+  if(last > prev) score += 2;
+  if(last > c.at(-2)) score += 1;
+
+  score = clamp(score);
+
+  if(score < MIN_SCORE_TREND) return null;
+
+  const entry = last;
+  const stop = Math.min(...c.slice(-5));
+  const tp2 = entry + (entry - stop) * 1.5;
+
+  const R = rr(entry, stop, tp2);
+  if(R < MIN_RR_TREND) return null;
+
+  return {
+    mode:"TREND",
+    coin:sym,
+    side:"LONG",
+    score,
+    entry,
+    stop,
+    tp2,
+    rr:R
+  };
 }
 
-function calcRSI(closesArr, period = 14) {
-  if (closesArr.length < period + 1) return [50];
+async function send(msg){
+  if(!TG_TOKEN || !CHAT_ID) return;
 
-  let gains = 0;
-  let losses = 0;
-  for (let i = 1; i <= period; i++) {
-    const d = closesArr[i] - closesArr[i - 1];
-    if (d >= 0) gains += d;
-    else losses -= d;
-  }
-
-  let avgGain = gains / period;
-  let avgLoss = losses / period;
-  const out = [50];
-
-  for (let i = period + 1; i < closesArr.length; i++) {
-    const d = closesArr[i] - closesArr[i - 1];
-    const gain = Math.max(d, 0);
-    const loss = Math.max(-d, 0);
-
-    avgGain = ((avgGain * (period - 1)) + gain) / period;
-    avgLoss = ((avgLoss * (period - 1)) + loss) / period;
-
-    const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-    out.push(100 - (100 / (1 + rs)));
-  }
-
-  return out;
+  await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{
+    method:"POST",
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({chat_id:CHAT_ID,text:msg})
+  });
 }
 
-function atrFromKlines(klines, period = 14) {
-  if (!Array.isArray(klines) || klines.length < period + 2) return null;
+function fmt(s){
+  return `🔥 ${s.mode}
 
-  const h = highs(klines);
-  const l = lows(klines);
-  const c = closes(klines);
+${s.coin}
+Score: ${s.score}/10
+RR: ${s.rr.toFixed(2)}
 
-  const trs = [];
-  for (let i = 1; i < klines.length; i++) {
-    trs.push(
-      Math.max(
-        h[i] - l[i],
-        Math.abs(h[i] - c[i - 1]),
-        Math.abs(l[i] - c[i - 1])
-      )
-    );
-  }
-
-  let atr = avg(trs.slice(0, period));
-  for (let i = period; i < trs.length; i++) {
-    atr = ((atr * (period - 1)) + trs[i]) / period;
-  }
-
-  return atr;
+Entry: ${s.entry}
+Stop: ${s.stop}
+TP: ${s.tp2}`;
 }
 
-function fmt(n) {
-  if (!Number.isFinite(n)) return "-";
-  if (Math.abs(n) >= 1000) return n.toFixed(2);
-  if (Math.abs(n) >= 1) return n.toFixed(4);
-  return n.toFixed(6);
-}
-
-function rr(entry, stop, tp2) {
-  const risk = Math.abs(entry - stop);
-  const reward = Math.abs(tp2 - entry);
-  if (risk <= 0) return 0;
-  return reward / risk;
-}
-
-function clampScore(n) {
-  if (!Number.isFinite(n)) return 0;
-  return Math.max(0, Math.min(10, n));
-}
-
-function shouldSkipDuplicate(signalKey) {
-  const ts = lastSignalAt.get(signalKey);
-  if (!ts) return false;
-  return (Date.now() - ts) < DUPLICATE_TTL_MS;
-}
-
-function markSignal(signalKey) {
-  lastSignalAt.set(signalKey, Date.now());
-}
-
-async function checkSniper(symbol) {
-  try {
-    const [entryData, trendData, htfData] = await Promise.all([
-      fetchKlines(symbol, ENTRY_TF, 120),
-      fetchKlines(symbol, TREND_TF, 120),
-      fetchKlines(symbol, HTF, 120),
-    ]);
-
-    if (!entryData || !trendData || !htfData) return null;
-
-    const c = closes(entryData);
-    const o = opens(entryData);
-    const h = highs(entryData);
-    const l = lows(entryData);
-    const v = volumes(entryData);
-
-    const cTrend = closes(trendData);
-    const cHtf = closes(htfData);
-
-    const ema20Entry = ema(c, 20);
-    const ema20Trend = ema(cTrend, 20);
-    const ema50Trend = ema(cTrend, 50);
-    const ema20Htf = ema(cHtf, 20);
-    const ema50Htf = ema(cHtf, 50);
-
-    const atr = atrFromKlines(entryData, 14);
-    if (!atr) return null;
-
-    const atrPct = (atr / c.at(-1)) * 100;
-    if (atrPct < 0.35) return null;
-
-    const last = c.at(-1);
-    const prev = c.at(-2);
-    const prev2 = c.at(-3);
-
-    const pOpen = o.at(-2);
-    const pHigh = h.at(-2);
-    const pLow = l.at(-2);
-    const ppHigh = h.at(-3);
-    const ppLow = l.at(-3);
-
-    const avgVolNow = avg(v.slice(-20, -1));
-    const volNow = v.at(-1);
-    const volumeSpike = volNow > avgVolNow * 1.30;
-    if (!volumeSpike) return null;
-
-    const trendLong = ema20Trend.at(-1) > ema50Trend.at(-1) && ema20Htf.at(-1) > ema50Htf.at(-1);
-    const trendShort = ema20Trend.at(-1) < ema50Trend.at(-1) && ema20Htf.at(-1) < ema50Htf.at(-1);
-
-    const recentHigh = Math.max(...h.slice(-10, -3));
-    const recentLow = Math.min(...l.slice(-10, -3));
-
-    const sweepLong = ppLow < recentLow && prev > recentLow;
-    const sweepShort = ppHigh > recentHigh && prev < recentHigh;
-
-    const prevRange = Math.max(pHigh - pLow, 0.0000001);
-    const prevBody = Math.abs(prev - pOpen);
-    const prevUpper = pHigh - Math.max(pOpen, prev);
-    const prevLower = Math.min(pOpen, prev) - pLow;
-    const prevBodyRatio = prevBody / prevRange;
-
-    const antiWickLong = prevUpper <= prevRange * 0.28;
-    const antiWickShort = prevLower <= prevRange * 0.28;
-
-    const confirmLong = prev > pOpen && prevBodyRatio >= 0.50 && antiWickLong;
-    const confirmShort = prev < pOpen && prevBodyRatio >= 0.50 && antiWickShort;
-
-    const reclaimLong = prev > recentLow && prev > ema20Entry.at(-2);
-    const reclaimShort = prev < recentHigh && prev < ema20Entry.at(-2);
-
-    const plannedLongEntry = Math.min(last, prev - atr * 0.05);
-    const plannedShortEntry = Math.max(last, prev + atr * 0.05);
-
-    const longContinuation = l.at(-1) > pLow && last > prev && last >= plannedLongEntry;
-    const shortContinuation = h.at(-1) < pHigh && last < prev && last <= plannedShortEntry;
-
-    const nearEmaLong = Math.abs(plannedLongEntry - ema20Entry.at(-1)) / plannedLongEntry * 100 <= 0.40;
-    const nearEmaShort = Math.abs(plannedShortEntry - ema20Entry.at(-1)) / plannedShortEntry * 100 <= 0.40;
-
-    const rsi = calcRSI(c, 14).at(-1);
-    const reactionLong = Math.abs(prev - recentLow) / atr;
-    const reactionShort = Math.abs(recentHigh - prev) / atr;
-    const displacement = Math.abs(prev - prev2);
-
-    if (Math.abs(prev - prev2) < atr * 0.8) return null;
-
-    let longScore = 0;
-    longScore += trendLong ? 2.8 : 0;
-    longScore += sweepLong ? 1.6 : 0;
-    longScore += reclaimLong ? 1.1 : 0;
-    longScore += confirmLong ? 1.1 : 0;
-    longScore += nearEmaLong ? 0.8 : 0;
-    longScore += volumeSpike ? 0.8 : 0;
-    longScore += (rsi >= 43 && rsi <= 60) ? 0.6 : 0;
-    longScore += reactionLong >= 1.1 ? 0.6 : 0;
-    longScore += displacement >= atr * 0.9 ? 0.6 : 0;
-
-    let shortScore = 0;
-    shortScore += trendShort ? 2.8 : 0;
-    shortScore += sweepShort ? 1.6 : 0;
-    shortScore += reclaimShort ? 1.1 : 0;
-    shortScore += confirmShort ? 1.1 : 0;
-    shortScore += nearEmaShort ? 0.8 : 0;
-    shortScore += volumeSpike ? 0.8 : 0;
-    shortScore += (rsi >= 40 && rsi <= 57) ? 0.6 : 0;
-    shortScore += reactionShort >= 1.1 ? 0.6 : 0;
-    shortScore += displacement >= atr * 0.9 ? 0.6 : 0;
-
-    longScore = clampScore(longScore);
-    shortScore = clampScore(shortScore);
-
-    if (
-      longScore >= MIN_SCORE_SNIPER &&
-      trendLong &&
-      sweepLong &&
-      reclaimLong &&
-      confirmLong &&
-      nearEmaLong &&
-      longContinuation &&
-      (rsi >= 43 && rsi <= 60) &&
-      reactionLong >= 1.1 &&
-      displacement >= atr * 0.9
-    ) {
-      const stop = Math.min(ppLow, recentLow) - atr * 0.75;
-      const tp1 = plannedLongEntry + (plannedLongEntry - stop) * 1.2;
-      const tp2 = plannedLongEntry + (plannedLongEntry - stop) * 2.0;
-      const tradeRR = rr(plannedLongEntry, stop, tp2);
-      if (tradeRR < MIN_RR_SNIPER) return null;
-
-      return {
-        mode: "SNIPER",
-        coin: symbol,
-        side: "LONG",
-        score: longScore,
-        entry: plannedLongEntry,
-        stop,
-        tp1,
-        tp2,
-        rr: tradeRR
-      };
-    }
-
-    if (
-      shortScore >= MIN_SCORE_SNIPER &&
-      trendShort &&
-      sweepShort &&
-      reclaimShort &&
-      confirmShort &&
-      nearEmaShort &&
-      shortContinuation &&
-      (rsi >= 40 && rsi <= 57) &&
-      reactionShort >= 1.1 &&
-      displacement >= atr * 0.9
-    ) {
-      const stop = Math.max(ppHigh, recentHigh) + atr * 0.75;
-      const tp1 = plannedShortEntry - (stop - plannedShortEntry) * 1.2;
-      const tp2 = plannedShortEntry - (stop - plannedShortEntry) * 2.0;
-      const tradeRR = rr(plannedShortEntry, stop, tp2);
-      if (tradeRR < MIN_RR_SNIPER) return null;
-
-      return {
-        mode: "SNIPER",
-        coin: symbol,
-        side: "SHORT",
-        score: shortScore,
-        entry: plannedShortEntry,
-        stop,
-        tp1,
-        tp2,
-        rr: tradeRR
-      };
-    }
-
-    return null;
-  } catch (e) {
-    console.log("SNIPER ERROR:", symbol, e?.message || e);
-    return null;
-  }
-}
-
-async function checkTrend(symbol) {
-  try {
-    const [entryData, trendData, htfData] = await Promise.all([
-      fetchKlines(symbol, ENTRY_TF, 80),
-      fetchKlines(symbol, TREND_TF, 80),
-      fetchKlines(symbol, HTF, 80)
-    ]);
-
-    if (!entryData || !trendData || !htfData) return null;
-
-    const c = closes(entryData);
-    const o = opens(entryData);
-    const h = highs(entryData);
-    const l = lows(entryData);
-    const v = volumes(entryData);
-
-    const cTrend = closes(trendData);
-    const cHtf = closes(htfData);
-
-    const ema20Entry = ema(c, 20);
-    const ema20Trend = ema(cTrend, 20);
-    const ema50Trend = ema(cTrend, 50);
-    const ema20Htf = ema(cHtf, 20);
-    const ema50Htf = ema(cHtf, 50);
-
-    const atr = atrFromKlines(entryData, 14);
-    if (!atr) return null;
-    const atrPct = (atr / c.at(-1)) * 100;
-    if (atrPct < 0.40) return null;
-
-    const last = c.at(-1);
-    const lastOpen = o.at(-1);
-    const lastHigh = h.at(-1);
-    const lastLow = l.at(-1);
-
-    const prevHigh5 = Math.max(...h.slice(-6, -1));
-    const prevLow5 = Math.min(...l.slice(-6, -1));
-
-    const volNow = v.at(-1);
-    const avgVolNow = avg(v.slice(-20, -1));
-    const volumeSpike = volNow > avgVolNow * 1.35;
-    if (!volumeSpike) return null;
-
-    const trendLong = ema20Trend.at(-1) > ema50Trend.at(-1) && ema20Htf.at(-1) > ema50Htf.at(-1);
-    const trendShort = ema20Trend.at(-1) < ema50Trend.at(-1) && ema20Htf.at(-1) < ema50Htf.at(-1);
-
-    const momentum = pctMove(c.at(-4), last);
-    const nearEma = Math.abs(last - ema20Entry.at(-1)) / last < 0.012;
-
-    const candleBody = Math.abs(last - lastOpen);
-    const candleRange = Math.max(lastHigh - lastLow, 0.0000001);
-    const upperWick = lastHigh - Math.max(last, lastOpen);
-    const lowerWick = Math.min(last, lastOpen) - lastLow;
-
-    let longScore = 0;
-    let shortScore = 0;
-
-    if (trendLong && last > prevHigh5) longScore += 4.2;
-    if (trendShort && last < prevLow5) shortScore += 4.2;
-
-    if (volumeSpike) {
-      longScore += 1.6;
-      shortScore += 1.6;
-    }
-
-    if (momentum > 0.22) longScore += 1.0;
-    if (momentum < -0.22) shortScore += 1.0;
-
-    if (nearEma) {
-      longScore += 0.9;
-      shortScore += 0.9;
-    }
-
-    if (candleBody > candleRange * 0.55) {
-      longScore += 0.8;
-      shortScore += 0.8;
-    }
-
-    if (upperWick < candleRange * 0.25) longScore += 0.5;
-    if (lowerWick < candleRange * 0.25) shortScore += 0.5;
-
-    longScore = clampScore(longScore);
-    shortScore = clampScore(shortScore);
-
-    if (longScore >= MIN_SCORE_TREND) {
-      const stop = prevLow5;
-      const tp1 = last + Math.abs(last - stop) * 1.0;
-      const tp2 = last + Math.abs(last - stop) * 1.8;
-      const tradeRR = rr(last, stop, tp2);
-      if (tradeRR < MIN_RR_TREND) return null;
-
-      return {
-        mode: "TREND",
-        coin: symbol,
-        side: "LONG",
-        score: longScore,
-        entry: last,
-        stop,
-        tp1,
-        tp2,
-        rr: tradeRR
-      };
-    }
-
-    if (shortScore >= MIN_SCORE_TREND) {
-      const stop = prevHigh5;
-      const tp1 = last - Math.abs(stop - last) * 1.0;
-      const tp2 = last - Math.abs(stop - last) * 1.8;
-      const tradeRR = rr(last, stop, tp2);
-      if (tradeRR < MIN_RR_TREND) return null;
-
-      return {
-        mode: "TREND",
-        coin: symbol,
-        side: "SHORT",
-        score: shortScore,
-        entry: last,
-        stop,
-        tp1,
-        tp2,
-        rr: tradeRR
-      };
-    }
-
-    return null;
-  } catch (e) {
-    console.log("TREND ERROR:", symbol, e?.message || e);
-    return null;
-  }
-}
-
-function formatSignal(sig) {
-  const sizeNote = sig.mode === "TREND" ? "TREND = KUCUK BOY" : "SNIPER = ANA SETUP";
-  return `🔥 ${sig.mode} SIGNAL
-
-Coin: ${sig.coin}
-Side: ${sig.side}
-Confidence: ${sig.score.toFixed(1)}/10
-
-Entry: ${fmt(sig.entry)}
-Stop: ${fmt(sig.stop)}
-TP1: ${fmt(sig.tp1)}
-TP2: ${fmt(sig.tp2)}
-RR: ${sig.rr.toFixed(2)}
-
-${sizeNote}`;
-}
-
-function formatExit(trade, price, state, reason) {
-  return `🔴 SMART EXIT
-
-Type: ${trade.mode}
-Coin: ${trade.coin}
-Side: ${trade.side}
-State: ${state}
-
-Entry: ${fmt(trade.entry)}
-Live: ${fmt(price)}
-Stop: ${fmt(trade.stop)}
-TP1: ${fmt(trade.tp1)}
-TP2: ${fmt(trade.tp2)}
-
-Reason: ${reason}`;
-}
-
-async function sendTelegram(msg) {
-  if (!TG_TOKEN || !CHAT_ID) {
-    console.log("TELEGRAM ENV MISSING");
-    return false;
-  }
-
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: CHAT_ID,
-        text: msg
-      })
-    });
-
-    const text = await res.text();
-    console.log("TELEGRAM RESPONSE:", text);
-    return res.ok;
-  } catch (e) {
-    console.log("TELEGRAM ERROR:", e?.message || e);
-    return false;
-  }
-}
-
-async function updateActiveTrade() {
-  if (!activeTrade) {
-    console.log("NO ACTIVE TRADE");
+async function run(){
+  console.log("RUN");
+
+  if(activeTrade){
+    console.log("ACTIVE TRADE VAR");
     return;
   }
 
-  console.log("ACTIVE TRADE CHECK:", activeTrade.coin, activeTrade.side);
+  let bestSniper=null,bestTrend=null;
 
-  const price = await fetchPrice(activeTrade.coin);
-  if (!price) {
-    console.log("ACTIVE TRADE PRICE FAILED");
-    return;
+  for(const c of COINS){
+    const s = await checkSniper(c);
+    if(s && (!bestSniper || s.score>bestSniper.score)) bestSniper=s;
+
+    const t = await checkTrend(c);
+    if(t && (!bestTrend || t.score>bestTrend.score)) bestTrend=t;
   }
 
-  let state = "HOLD";
-  let reason = "No decisive weakness.";
-
-  if (activeTrade.side === "LONG") {
-    if (!activeTrade.tp1Hit && price >= activeTrade.tp1) {
-      activeTrade.tp1Hit = true;
-      activeTrade.stop = activeTrade.entry;
-      state = "CONTINUE";
-      reason = "TP1 reached, stop moved to BE.";
-    } else if (price <= activeTrade.stop) {
-      state = "EXIT";
-      reason = "Stop reached.";
-    } else if (price >= activeTrade.tp2) {
-      state = "EXIT";
-      reason = "TP2 reached.";
-    }
-  } else {
-    if (!activeTrade.tp1Hit && price <= activeTrade.tp1) {
-      activeTrade.tp1Hit = true;
-      activeTrade.stop = activeTrade.entry;
-      state = "CONTINUE";
-      reason = "TP1 reached, stop moved to BE.";
-    } else if (price >= activeTrade.stop) {
-      state = "EXIT";
-      reason = "Stop reached.";
-    } else if (price <= activeTrade.tp2) {
-      state = "EXIT";
-      reason = "TP2 reached.";
-    }
-  }
-
-  if (state !== "HOLD") {
-    console.log("ACTIVE TRADE UPDATE:", state, reason);
-    await sendTelegram(formatExit(activeTrade, price, state, reason));
-  }
-
-  if (state === "EXIT") {
-    console.log("ACTIVE TRADE CLOSED");
-    activeTrade = null;
-  }
-}
-
-async function run() {
-  console.log("RUN CALISTI");
-
-  if (!COINS.length) {
-    console.log("COIN_LIST EMPTY");
-    return;
-  }
-
-  await updateActiveTrade();
-
-  if (activeTrade) {
-    console.log("ACTIVE TRADE EXISTS, NEW SIGNAL SKIPPED");
-    return;
-  }
-
-  let bestSniper = null;
-  let bestTrend = null;
-
-  for (const coin of COINS) {
-    if (badSymbols.has(coin)) continue;
-
-    const sniper = await checkSniper(coin);
-    if (sniper && (!bestSniper || sniper.score > bestSniper.score || (sniper.score === bestSniper.score && sniper.rr > bestSniper.rr))) {
-      bestSniper = sniper;
-    }
-
-    const trend = await checkTrend(coin);
-    if (trend && (!bestTrend || trend.score > bestTrend.score || (trend.score === bestTrend.score && trend.rr > bestTrend.rr))) {
-      bestTrend = trend;
-    }
-  }
-
-  console.log("BEST SNIPER:", bestSniper ? `${bestSniper.coin} ${bestSniper.score}/10 RR:${bestSniper.rr.toFixed(2)}` : "NONE");
-  console.log("BEST TREND:", bestTrend ? `${bestTrend.coin} ${bestTrend.score}/10 RR:${bestTrend.rr.toFixed(2)}` : "NONE");
+  console.log("SNIPER:",bestSniper?bestSniper.coin:"NONE");
+  console.log("TREND:",bestTrend?bestTrend.coin:"NONE");
 
   const best = bestSniper || bestTrend;
-  if (!best) {
-    console.log("NO SIGNAL FOUND");
+  if(!best){
+    console.log("NO SIGNAL");
     return;
   }
 
-  const signalKey = `${best.mode}:${best.coin}:${best.side}`;
-  if (shouldSkipDuplicate(signalKey)) {
-    console.log("DUPLICATE SKIPPED:", signalKey);
-    return;
-  }
+  const key = best.coin+best.mode;
+  if(dup(key)) return;
 
-  markSignal(signalKey);
+  mark(key);
 
-  console.log("SENDING SIGNAL:", best.mode, best.coin, best.side, "RR:", best.rr.toFixed(2), "CONF:", best.score.toFixed(1));
+  await send(fmt(best));
 
-  const sent = await sendTelegram(formatSignal(best));
-  if (!sent) {
-    console.log("SIGNAL SEND FAILED");
-    return;
-  }
-
-  activeTrade = {
-    ...best,
-    tp1Hit: false,
-    createdAt: Date.now()
-  };
-
-  console.log("ACTIVE TRADE OPENED:", activeTrade.coin, activeTrade.side);
+  activeTrade = best;
 }
 
-async function main() {
-  console.log("MAIN LOOP BASLADI");
-
-  if (!TG_TOKEN || !CHAT_ID || !COINS.length) {
-    console.log("Missing TG_BOT_TOKEN / TG_CHAT_ID / COIN_LIST");
+async function main(){
+  if(!TG_TOKEN || !CHAT_ID || !COINS.length){
+    console.log("ENV ERROR");
     process.exit(1);
   }
 
-  while (true) {
-    try {
-      await run();
-    } catch (e) {
-      console.log("RUN ERROR:", e?.message || e);
-    }
-
-    console.log("SLEEPING FOR", LOOP_MS, "ms");
-    await new Promise(resolve => setTimeout(resolve, LOOP_MS));
+  while(true){
+    try{await run()}catch(e){console.log(e)}
+    await new Promise(r=>setTimeout(r,LOOP_MS));
   }
 }
 
-main().catch(err => {
-  console.error("FATAL ERROR:", err);
-  process.exit(1);
-});
+main();
