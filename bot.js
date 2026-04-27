@@ -4,81 +4,79 @@ const CHAT_ID = process.env.TG_CHAT_ID;
 const ENTRY_TF = process.env.ENTRY_TF || "5m";
 const LOOP_MS = parseInt(process.env.LOOP_MS || "60000", 10);
 
-const MIN_SCORE = parseFloat(process.env.MIN_SCORE || "4.8");
+const MIN_SCORE = parseFloat(process.env.MIN_SCORE || "5.0");
 const MIN_RR = parseFloat(process.env.MIN_RR || "1.25");
 
-const BASES = [
-  "https://fapi.binance.com",
-  "https://fapi1.binance.com",
-  "https://fapi2.binance.com",
-  "https://fapi3.binance.com"
-];
+const OKX_BASE = "https://www.okx.com";
 
-const FALLBACK_SYMBOLS = [
+const COINS = [
   "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","DOGEUSDT",
   "AVAXUSDT","LINKUSDT","DOTUSDT","ATOMUSDT","INJUSDT","NEARUSDT","APTUSDT",
   "OPUSDT","ARBUSDT","SEIUSDT","SUIUSDT","LTCUSDT","BCHUSDT","ICPUSDT",
   "STXUSDT","THETAUSDT","ALGOUSDT","VETUSDT","XLMUSDT","HBARUSDT",
   "EGLDUSDT","AXSUSDT","SANDUSDT","MANAUSDT","GALAUSDT","APEUSDT",
-  "PEPEUSDT","FLOKIUSDT","BLURUSDT","ENSUSDT","CHZUSDT","CRVUSDT"
+  "PEPEUSDT","FLOKIUSDT","BLURUSDT","ENSUSDT","CHZUSDT","CRVUSDT",
+  "RUNEUSDT","IMXUSDT","GMXUSDT","LDOUSDT","MINAUSDT","SNXUSDT",
+  "DYDXUSDT","ZILUSDT","1INCHUSDT","KAVAUSDT","ROSEUSDT","CELOUSDT",
+  "QTUMUSDT","ONTUSDT"
 ];
 
-let SYMBOLS = [];
 let activeTrade = null;
 
-console.log("🔥 AUTO + FALLBACK SCANNER START");
+console.log("🔥 OKX V11 SCANNER START");
+console.log("COIN COUNT:", COINS.length);
 
-async function fetchJson(path) {
-  for (const base of BASES) {
-    try {
-      const r = await fetch(base + path);
-      if (!r.ok) {
-        console.log("FETCH FAIL:", base, r.status, path);
-        continue;
-      }
-      return await r.json();
-    } catch (e) {
-      console.log("FETCH ERROR:", base, e.message);
-    }
-  }
-  return null;
+function toOkxSymbol(symbol) {
+  return symbol.replace("USDT", "-USDT-SWAP");
 }
 
-async function loadSymbols() {
-  const info = await fetchJson("/fapi/v1/exchangeInfo");
+async function fetchJson(path) {
+  try {
+    const r = await fetch(OKX_BASE + path, {
+      headers: {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0"
+      }
+    });
 
-  if (info && Array.isArray(info.symbols)) {
-    const symbols = info.symbols
-      .filter(s =>
-        s.contractType === "PERPETUAL" &&
-        s.quoteAsset === "USDT" &&
-        s.status === "TRADING"
-      )
-      .map(s => s.symbol);
+    if (!r.ok) {
+      console.log("OKX FETCH FAIL:", r.status, path);
+      return null;
+    }
 
-    console.log("AUTO SYMBOL COUNT:", symbols.length);
-
-    if (symbols.length > 0) return symbols;
+    return await r.json();
+  } catch (e) {
+    console.log("OKX FETCH ERROR:", e.message);
+    return null;
   }
-
-  console.log("AUTO SYMBOL LOAD FAILED, USING FALLBACK LIST");
-  console.log("FALLBACK COUNT:", FALLBACK_SYMBOLS.length);
-  return FALLBACK_SYMBOLS;
 }
 
 async function klines(symbol) {
-  return fetchJson(`/fapi/v1/klines?symbol=${symbol}&interval=${ENTRY_TF}&limit=120`);
+  const instId = toOkxSymbol(symbol);
+  const d = await fetchJson(`/api/v5/market/candles?instId=${instId}&bar=${ENTRY_TF}&limit=120`);
+
+  if (!d || d.code !== "0" || !Array.isArray(d.data)) return null;
+
+  return d.data
+    .slice()
+    .reverse()
+    .map(x => ({
+      open: Number(x[1]),
+      high: Number(x[2]),
+      low: Number(x[3]),
+      close: Number(x[4]),
+      volume: Number(x[5])
+    }));
 }
 
 async function price(symbol) {
-  const d = await fetchJson(`/fapi/v1/ticker/price?symbol=${symbol}`);
-  return d?.price ? Number(d.price) : null;
-}
+  const instId = toOkxSymbol(symbol);
+  const d = await fetchJson(`/api/v5/market/ticker?instId=${instId}`);
 
-function closes(d) { return d.map(x => Number(x[4])); }
-function highs(d) { return d.map(x => Number(x[2])); }
-function lows(d) { return d.map(x => Number(x[3])); }
-function volumes(d) { return d.map(x => Number(x[5])); }
+  if (!d || d.code !== "0" || !d.data?.[0]?.last) return null;
+
+  return Number(d.data[0].last);
+}
 
 function avg(a) {
   if (!a.length) return 0;
@@ -126,7 +124,7 @@ async function send(msg) {
 }
 
 function signalText(s) {
-  return `🔥 SIGNAL
+  return `🔥 OKX DATA SIGNAL
 
 Coin: ${s.coin}
 Side: ${s.side}
@@ -135,7 +133,9 @@ RR: ${s.rr.toFixed(2)}
 
 Entry: ${fmt(s.entry)}
 Stop: ${fmt(s.stop)}
-TP: ${fmt(s.tp)}`;
+TP: ${fmt(s.tp)}
+
+Not: Veri OKX, işlem açacaksan Binance fiyatını kontrol et.`;
 }
 
 async function scan(symbol, debug) {
@@ -148,10 +148,10 @@ async function scan(symbol, debug) {
     return null;
   }
 
-  const c = closes(d);
-  const h = highs(d);
-  const l = lows(d);
-  const v = volumes(d);
+  const c = d.map(x => x.close);
+  const h = d.map(x => x.high);
+  const l = d.map(x => x.low);
+  const v = d.map(x => x.volume);
 
   const last = c.at(-1);
   const prev = c.at(-2);
@@ -203,6 +203,7 @@ async function scan(symbol, debug) {
 
   if (longScore >= 3 || shortScore >= 3) {
     debug.candidates++;
+    console.log(symbol, "CANDIDATE", "L:", longScore.toFixed(1), "S:", shortScore.toFixed(1));
   }
 
   if (longScore >= MIN_SCORE && trendLong && momentumLong && nearHigh) {
@@ -295,15 +296,6 @@ async function updateTrade() {
 async function run() {
   console.log("RUN");
 
-  if (!SYMBOLS.length) {
-    SYMBOLS = await loadSymbols();
-  }
-
-  if (!SYMBOLS.length) {
-    console.log("NO SYMBOLS");
-    return;
-  }
-
   await updateTrade();
 
   if (activeTrade) {
@@ -322,7 +314,7 @@ async function run() {
 
   let best = null;
 
-  for (const symbol of SYMBOLS) {
+  for (const symbol of COINS) {
     const s = await scan(symbol, debug);
 
     if (s && (!best || s.score > best.score || (s.score === best.score && s.rr > best.rr))) {
@@ -351,8 +343,6 @@ async function main() {
     console.log("ENV ERROR: TG_BOT_TOKEN / TG_CHAT_ID");
     return;
   }
-
-  SYMBOLS = await loadSymbols();
 
   while (true) {
     try {
