@@ -2,169 +2,241 @@ const TG_TOKEN = process.env.TG_BOT_TOKEN;
 const CHAT_ID = process.env.TG_CHAT_ID;
 
 const ENTRY_TF = process.env.ENTRY_TF || "5m";
-const LOOP_MS = parseInt(process.env.LOOP_MS || "60000", 10);
+const TREND_TF = process.env.TREND_TF || "15m";
+const HTF = process.env.HTF || "1h";
 
-const MIN_SCORE = 4.5;
-const MIN_RR = 1.3;
+const MIN_SCORE_SNIPER = parseFloat(process.env.MIN_SCORE_SNIPER || "7.0");
+const MIN_SCORE_TREND = parseFloat(process.env.MIN_SCORE_TREND || "6.0");
 
-const BASE = "https://fapi.binance.com";
+const MIN_RR_SNIPER = parseFloat(process.env.MIN_RR_SNIPER || "1.8");
+const MIN_RR_TREND = parseFloat(process.env.MIN_RR_TREND || "1.5");
+
+const LOOP_MS = parseInt(process.env.LOOP_MS || "90000", 10);
+const DUPLICATE_TTL_MS = parseInt(process.env.DUPLICATE_TTL_MS || "2700000", 10);
+
+const BASE_URLS = [
+  "https://fapi.binance.com",
+];
 
 const COINS = (process.env.COIN_LIST || "")
   .split(",")
   .map(s => s.trim().toUpperCase())
   .filter(Boolean);
 
+const lastSignalAt = new Map();
 let activeTrade = null;
 
-console.log("🔥 V10 BALANCED START");
+console.log("🔥 V10 BALANCED + DEBUG START");
 console.log("COIN COUNT:", COINS.length);
 
-async function fetchJson(url) {
+async function fetchJson(path) {
   try {
-    const r = await fetch(url);
-    if (!r.ok) return null;
-    return await r.json();
+    const res = await fetch(BASE_URLS[0] + path);
+    if (!res.ok) return null;
+    return await res.json();
   } catch {
     return null;
   }
 }
 
-async function klines(symbol) {
-  return await fetchJson(`${BASE}/fapi/v1/klines?symbol=${symbol}&interval=${ENTRY_TF}&limit=120`);
+async function fetchKlines(symbol, tf) {
+  return await fetchJson(`/fapi/v1/klines?symbol=${symbol}&interval=${tf}&limit=120`);
 }
 
-function closes(d){return d.map(x=>+x[4]);}
-function highs(d){return d.map(x=>+x[2]);}
-function lows(d){return d.map(x=>+x[3]);}
-function volumes(d){return d.map(x=>+x[5]);}
+function closes(k) { return k.map(x => parseFloat(x[4])); }
 
-function ema(a,p){
-  let k=2/(p+1),e=a[0];
-  return a.map(v=>e=v*k+e*(1-k));
+function ema(values, period) {
+  const k = 2 / (period + 1);
+  let prev = values[0];
+  return values.map(v => prev = v * k + prev * (1 - k));
 }
 
-function avg(a){return a.reduce((x,y)=>x+y,0)/a.length;}
+function avg(arr) {
+  return arr.reduce((a,b)=>a+b,0)/arr.length;
+}
 
-function rr(e,s,tp){return Math.abs(tp-e)/Math.abs(e-s);}
+function rr(entry, stop, tp) {
+  return Math.abs(tp-entry)/Math.abs(entry-stop);
+}
 
-function fmt(n){return n.toFixed(4);}
+function clampScore(n){
+  return Math.max(0, Math.min(10,n));
+}
 
-async function send(msg){
-  if(!TG_TOKEN||!CHAT_ID)return;
+async function checkSniper(symbol) {
+  const data = await fetchKlines(symbol, ENTRY_TF);
+  if (!data) return null;
+
+  const c = closes(data);
+  const e20 = ema(c,20);
+
+  const last = c.at(-1);
+  const prev = c.at(-2);
+
+  const move = Math.abs((last-prev)/prev*100);
+
+  if (move < 0.25) return null;
+
+  let score = move * 10;
+
+  score = clampScore(score);
+
+  if (score < MIN_SCORE_SNIPER) return null;
+
+  const stop = prev;
+  const tp = last + (last - stop) * 2;
+
+  const r = rr(last, stop, tp);
+  if (r < MIN_RR_SNIPER) return null;
+
+  return {
+    mode: "SNIPER",
+    coin: symbol,
+    side: last > prev ? "LONG" : "SHORT",
+    score,
+    entry: last,
+    stop,
+    tp,
+    rr: r
+  };
+}
+
+async function checkTrend(symbol) {
+  const data = await fetchKlines(symbol, TREND_TF);
+  if (!data) return null;
+
+  const c = closes(data);
+  const e20 = ema(c,20);
+  const e50 = ema(c,50);
+
+  const trendUp = e20.at(-1) > e50.at(-1);
+  const trendDown = e20.at(-1) < e50.at(-1);
+
+  let score = 0;
+
+  if (trendUp || trendDown) score += 6;
+
+  score = clampScore(score);
+
+  if (score < MIN_SCORE_TREND) return null;
+
+  const last = c.at(-1);
+  const stop = c.at(-2);
+  const tp = last + (last - stop) * 1.8;
+
+  const r = rr(last, stop, tp);
+  if (r < MIN_RR_TREND) return null;
+
+  return {
+    mode: "TREND",
+    coin: symbol,
+    side: trendUp ? "LONG" : "SHORT",
+    score,
+    entry: last,
+    stop,
+    tp,
+    rr: r
+  };
+}
+
+function shouldSkipDuplicate(key) {
+  const t = lastSignalAt.get(key);
+  return t && Date.now() - t < DUPLICATE_TTL_MS;
+}
+
+function markSignal(key){
+  lastSignalAt.set(key, Date.now());
+}
+
+async function sendTelegram(msg){
+  if (!TG_TOKEN || !CHAT_ID) return;
+
   await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{
     method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({chat_id:CHAT_ID,text:msg})
+    headers:{ "Content-Type":"application/json"},
+    body: JSON.stringify({
+      chat_id: CHAT_ID,
+      text: msg
+    })
   });
 }
 
-async function scan(symbol){
-  const d = await klines(symbol);
-  if(!d) return null;
+function formatSignal(s){
+  return `🔥 ${s.mode}
 
-  const c=closes(d),h=highs(d),l=lows(d),v=volumes(d);
-  const last=c.at(-1);
+${s.coin} ${s.side}
+Score: ${s.score.toFixed(1)}
 
-  const breakoutHigh = Math.max(...h.slice(-11,-1));
-  const breakoutLow  = Math.min(...l.slice(-11,-1));
-
-  const ema20 = ema(c,20).at(-1);
-
-  const volNow = v.at(-1);
-  const volAvg = avg(v.slice(-20,-1));
-
-  let longScore=0, shortScore=0;
-
-  // 🔥 breakout (gevşetildi)
-  if(last > breakoutHigh*0.998) longScore+=2.5;
-  if(last < breakoutLow*1.002) shortScore+=2.5;
-
-  // 🔥 volume (gevşetildi)
-  if(volNow > volAvg*1.05){
-    longScore+=1.5;
-    shortScore+=1.5;
-  }
-
-  // 🔥 EMA yakınlık
-  if(Math.abs(last-ema20)/last < 0.015){
-    longScore+=1;
-    shortScore+=1;
-  }
-
-  // 🔥 mini momentum
-  if(c.at(-1) > c.at(-3)) longScore+=0.5;
-  if(c.at(-1) < c.at(-3)) shortScore+=0.5;
-
-  // DEBUG
-  if(longScore>2 || shortScore>2){
-    console.log(symbol,"SCORE",longScore,shortScore);
-  }
-
-  if(longScore>=MIN_SCORE){
-    const stop = breakoutLow;
-    const tp = last + (last-stop)*1.5;
-
-    if(rr(last,stop,tp)<MIN_RR) return null;
-
-    return {coin:symbol,side:"LONG",entry:last,stop,tp,score:longScore};
-  }
-
-  if(shortScore>=MIN_SCORE){
-    const stop = breakoutHigh;
-    const tp = last - (stop-last)*1.5;
-
-    if(rr(last,stop,tp)<MIN_RR) return null;
-
-    return {coin:symbol,side:"SHORT",entry:last,stop,tp,score:shortScore};
-  }
-
-  return null;
+Entry: ${s.entry}
+Stop: ${s.stop}
+TP: ${s.tp}
+RR: ${s.rr.toFixed(2)}`;
 }
 
 async function run(){
+
   console.log("RUN");
 
-  if(!COINS.length){
-    console.log("COIN EMPTY");
-    return;
-  }
+  let debug = {
+    checked: 0,
+    sniperPassed: 0,
+    trendPassed: 0
+  };
 
-  if(activeTrade){
-    console.log("WAIT ACTIVE");
-    return;
-  }
+  let best = null;
 
-  let best=null;
+  for (const coin of COINS){
 
-  for(const coin of COINS){
-    const s = await scan(coin);
-    if(s && (!best || s.score>best.score)){
-      best=s;
+    debug.checked++;
+
+    const s = await checkSniper(coin);
+    if (s){
+      debug.sniperPassed++;
+      if (!best || s.score > best.score) best = s;
+    }
+
+    const t = await checkTrend(coin);
+    if (t){
+      debug.trendPassed++;
+      if (!best || t.score > best.score) best = t;
     }
   }
 
-  if(!best){
+  console.log("DEBUG:", debug);
+
+  if (!best){
     console.log("NO SIGNAL");
     return;
   }
 
-  console.log("SIGNAL",best.coin,best.side);
+  const key = `${best.mode}-${best.coin}-${best.side}`;
+  if (shouldSkipDuplicate(key)){
+    console.log("DUPLICATE");
+    return;
+  }
 
-  await send(`🔥 SIGNAL
+  markSignal(key);
 
-${best.coin} ${best.side}
-Entry: ${fmt(best.entry)}
-Stop: ${fmt(best.stop)}
-TP: ${fmt(best.tp)}
-Score: ${best.score}`);
+  console.log("SIGNAL:", best.coin);
 
-  activeTrade=best;
+  await sendTelegram(formatSignal(best));
 }
 
 async function main(){
+
+  if (!COINS.length){
+    console.log("COIN LIST EMPTY");
+    return;
+  }
+
   while(true){
-    try{await run();}catch(e){console.log(e);}
-    await new Promise(r=>setTimeout(r,LOOP_MS));
+    try{
+      await run();
+    }catch(e){
+      console.log("ERROR:", e.message);
+    }
+
+    await new Promise(r=>setTimeout(r, LOOP_MS));
   }
 }
 
