@@ -1,17 +1,17 @@
 const TG_TOKEN = process.env.TG_BOT_TOKEN;
 const CHAT_ID = process.env.TG_CHAT_ID;
 
-const LOOP_MS = parseInt(process.env.LOOP_MS || "60000", 10);
+const LOOP_MS = 60000;
 
-const MIN_RR_SNIPER = 2.0;
-const MIN_RR_TREND = 1.7;
+const MIN_RR_SNIPER = 2.5;
+const MIN_RR_TREND = 2.2;
 
 const OKX = "https://www.okx.com";
 
 let symbols = [];
 let activeTrade = null;
 
-console.log("🔥 V13 OKX PRO START");
+console.log("🔥 V14 ELITE MODE START");
 
 // ================= FETCH =================
 async function fetchJson(url){
@@ -24,17 +24,11 @@ async function fetchJson(url){
   }
 }
 
-// ================= SYMBOL FIX =================
+// ================= SYMBOL =================
 async function loadSymbols(){
-  const url = `${OKX}/api/v5/public/instruments?instType=SWAP`;
-  const j = await fetchJson(url);
+  const j = await fetchJson(`${OKX}/api/v5/public/instruments?instType=SWAP`);
+  if(!j || !j.data) return;
 
-  if(!j || !Array.isArray(j.data)){
-    console.log("SYMBOL LOAD FAIL");
-    return;
-  }
-
-  // 🔥 FIXED VERSION
   symbols = j.data
     .filter(s => s.instId.endsWith("-USDT-SWAP"))
     .map(s => s.instId.replace("-USDT-SWAP","USDT"));
@@ -47,10 +41,8 @@ function toOkx(sym){
   return sym.replace("USDT","-USDT-SWAP");
 }
 
-async function klines(sym, tf="5m"){
-  const url = `${OKX}/api/v5/market/candles?instId=${toOkx(sym)}&bar=${tf}&limit=120`;
-  const j = await fetchJson(url);
-
+async function klines(sym, tf){
+  const j = await fetchJson(`${OKX}/api/v5/market/candles?instId=${toOkx(sym)}&bar=${tf}&limit=120`);
   if(!j || j.code!=="0") return null;
 
   return j.data.reverse().map(x=>({
@@ -59,8 +51,7 @@ async function klines(sym, tf="5m"){
 }
 
 async function price(sym){
-  const url = `${OKX}/api/v5/market/ticker?instId=${toOkx(sym)}`;
-  const j = await fetchJson(url);
+  const j = await fetchJson(`${OKX}/api/v5/market/ticker?instId=${toOkx(sym)}`);
   if(!j || j.code!=="0") return null;
   return +j.data[0].last;
 }
@@ -91,116 +82,139 @@ function rr(e,s,tp){
 }
 
 // ================= FILTER =================
-function fakeFilter(c){
-  const last=c.at(-1);
+function fakeBreakoutFilter(d){
+  const last=d.at(-1);
   const body=Math.abs(last.c-last.o);
   const range=last.h-last.l;
 
-  if(body/range<0.25) return false;
-  if((last.h-last.c)/range>0.5) return false;
+  const upper=last.h-Math.max(last.c,last.o);
+  const lower=Math.min(last.c,last.o)-last.l;
+
+  if(body/range < 0.3) return false;
+  if(upper/range > 0.5) return false;
+  if(lower/range > 0.5) return false;
 
   return true;
 }
 
 // ================= SCAN =================
 async function scan(sym){
-  const d=await klines(sym);
-  if(!d||d.length<80) return null;
 
-  const c=d.map(x=>x.c);
-  const v=d.map(x=>x.v);
+  const d5 = await klines(sym,"5m");
+  const d15 = await klines(sym,"15m");
 
-  const e20=ema(c,20);
-  const e50=ema(c,50);
+  if(!d5 || !d15) return null;
+  if(d5.length < 80 || d15.length < 80) return null;
 
-  const last=c.at(-1);
-  const prev=c.at(-2);
+  if(!fakeBreakoutFilter(d5)) return null;
 
-  const volNow=v.at(-1);
-  const volAvg=avg(v.slice(-20));
+  const c5 = d5.map(x=>x.c);
+  const c15 = d15.map(x=>x.c);
+  const v = d5.map(x=>x.v);
 
-  const trendUp=e20.at(-1)>e50.at(-1);
-  const trendDn=e20.at(-1)<e50.at(-1);
+  const e20_5 = ema(c5,20);
+  const e50_5 = ema(c5,50);
 
-  const volOk=volNow>volAvg*1.2;
+  const e20_15 = ema(c15,20);
+  const e50_15 = ema(c15,50);
 
-  if(!fakeFilter(d)) return null;
+  const last = c5.at(-1);
+  const prev = c5.at(-2);
 
-  // ===== SNIPER =====
-  if(trendUp && prev<e20.at(-2) && last>e20.at(-1) && volOk){
-    let stop=Math.min(...d.slice(-8).map(x=>x.l));
-    let tp2=last+(last-stop)*2;
-    let R=rr(last,stop,tp2);
-    if(R<MIN_RR_SNIPER) return null;
+  const volNow = v.at(-1);
+  const volAvg = avg(v.slice(-20));
+
+  const atrVal = atr(d5);
+
+  // 🔥 ELITE FILTERS
+  if((atrVal/last)*100 < 0.25) return null; // volatilite düşük → skip
+  if(volNow < volAvg*1.5) return null;      // volume düşük → skip
+
+  const trendUp = e20_5.at(-1)>e50_5.at(-1) && e20_15.at(-1)>e50_15.at(-1);
+  const trendDn = e20_5.at(-1)<e50_5.at(-1) && e20_15.at(-1)<e50_15.at(-1);
+
+  const momentumUp = last > prev;
+  const momentumDn = last < prev;
+
+  // ================= SNIPER =================
+  if(trendUp && prev < e20_5.at(-2) && last > e20_5.at(-1) && momentumUp){
+
+    const entry = last;
+    const stop = Math.min(...d5.slice(-10).map(x=>x.l));
+
+    const tp1 = entry + (entry - stop)*1.2;
+    const tp2 = entry + (entry - stop)*2.6;
+
+    const R = rr(entry,stop,tp2);
+    if(R < MIN_RR_SNIPER) return null;
 
     return {
       mode:"SNIPER",
       side:"LONG",
       symbol:sym,
-      entry:last,
-      stop,
-      tp1:last+(last-stop),
-      tp2,
-      rr:R,
-      score:8
+      entry,stop,tp1,tp2,rr:R,score:9
     };
   }
 
-  if(trendDn && prev>e20.at(-2) && last<e20.at(-1) && volOk){
-    let stop=Math.max(...d.slice(-8).map(x=>x.h));
-    let tp2=last-(stop-last)*2;
-    let R=rr(last,stop,tp2);
-    if(R<MIN_RR_SNIPER) return null;
+  if(trendDn && prev > e20_5.at(-2) && last < e20_5.at(-1) && momentumDn){
+
+    const entry = last;
+    const stop = Math.max(...d5.slice(-10).map(x=>x.h));
+
+    const tp1 = entry - (stop-entry)*1.2;
+    const tp2 = entry - (stop-entry)*2.6;
+
+    const R = rr(entry,stop,tp2);
+    if(R < MIN_RR_SNIPER) return null;
 
     return {
       mode:"SNIPER",
       side:"SHORT",
       symbol:sym,
-      entry:last,
-      stop,
-      tp1:last-(stop-last),
-      tp2,
-      rr:R,
-      score:8
+      entry,stop,tp1,tp2,rr:R,score:9
     };
   }
 
-  // ===== TREND =====
-  if(trendUp && volOk){
-    let stop=Math.min(...d.slice(-10).map(x=>x.l));
-    let tp2=last+(last-stop)*1.8;
-    let R=rr(last,stop,tp2);
+  // ================= TREND =================
+  if(trendUp){
+    const entry=last;
+    const stop=Math.min(...d5.slice(-12).map(x=>x.l));
+
+    const tp2=entry+(entry-stop)*2.2;
+    const R=rr(entry,stop,tp2);
+
     if(R<MIN_RR_TREND) return null;
 
     return {
       mode:"TREND",
       side:"LONG",
       symbol:sym,
-      entry:last,
-      stop,
-      tp1:last+(last-stop)*0.9,
+      entry,stop,
+      tp1:entry+(entry-stop),
       tp2,
       rr:R,
-      score:6
+      score:7
     };
   }
 
-  if(trendDn && volOk){
-    let stop=Math.max(...d.slice(-10).map(x=>x.h));
-    let tp2=last-(stop-last)*1.8;
-    let R=rr(last,stop,tp2);
+  if(trendDn){
+    const entry=last;
+    const stop=Math.max(...d5.slice(-12).map(x=>x.h));
+
+    const tp2=entry-(stop-entry)*2.2;
+    const R=rr(entry,stop,tp2);
+
     if(R<MIN_RR_TREND) return null;
 
     return {
       mode:"TREND",
       side:"SHORT",
       symbol:sym,
-      entry:last,
-      stop,
-      tp1:last-(stop-last)*0.9,
+      entry,stop,
+      tp1:entry-(stop-entry),
       tp2,
       rr:R,
-      score:6
+      score:7
     };
   }
 
@@ -218,37 +232,45 @@ async function send(msg){
 
 // ================= EXIT =================
 async function update(){
+
   if(!activeTrade) return;
 
-  const p=await price(activeTrade.symbol);
+  const p = await price(activeTrade.symbol);
   if(!p) return;
 
   if(activeTrade.side==="LONG"){
+
     if(!activeTrade.tp1Hit && p>=activeTrade.tp1){
       activeTrade.tp1Hit=true;
       activeTrade.stop=activeTrade.entry;
-      await send("TP1 HIT BE");
+      await send("🟡 TP1 → BE");
     }
+
     if(p>=activeTrade.tp2){
-      await send("TP2 HIT");
+      await send("🟢 TP2 HIT");
       activeTrade=null;
     }
+
     if(p<=activeTrade.stop){
-      await send("STOP EXIT");
+      await send("🔴 STOP");
       activeTrade=null;
     }
+
   }else{
+
     if(!activeTrade.tp1Hit && p<=activeTrade.tp1){
       activeTrade.tp1Hit=true;
       activeTrade.stop=activeTrade.entry;
-      await send("TP1 HIT BE");
+      await send("🟡 TP1 → BE");
     }
+
     if(p<=activeTrade.tp2){
-      await send("TP2 HIT");
+      await send("🟢 TP2 HIT");
       activeTrade=null;
     }
+
     if(p>=activeTrade.stop){
-      await send("STOP EXIT");
+      await send("🔴 STOP");
       activeTrade=null;
     }
   }
@@ -256,18 +278,27 @@ async function update(){
 
 // ================= MAIN =================
 async function run(){
+
   await update();
 
   if(activeTrade) return;
 
-  let best=null;
+  let bestSniper=null;
+  let bestTrend=null;
 
   for(const s of symbols){
+
     const sig=await scan(s);
     if(!sig) continue;
 
-    if(!best || sig.rr>best.rr) best=sig;
+    if(sig.mode==="SNIPER"){
+      if(!bestSniper || sig.rr>bestSniper.rr) bestSniper=sig;
+    }else{
+      if(!bestTrend || sig.rr>bestTrend.rr) bestTrend=sig;
+    }
   }
+
+  const best = bestSniper || bestTrend;
 
   if(!best){
     console.log("NO SIGNAL");
@@ -289,12 +320,17 @@ Stop: ${best.stop}`);
 
 // ================= LOOP =================
 (async()=>{
+
   await loadSymbols();
 
   while(true){
-    try{ await run(); }
-    catch(e){ console.log("ERR",e.message); }
+    try{
+      await run();
+    }catch(e){
+      console.log("ERR",e.message);
+    }
 
     await new Promise(r=>setTimeout(r,LOOP_MS));
   }
+
 })();
