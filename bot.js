@@ -1,251 +1,361 @@
 const TG_TOKEN = process.env.TG_BOT_TOKEN;
 const CHAT_ID = process.env.TG_CHAT_ID;
 
-const LOOP_MS = 60000;
+const LOOP_MS = parseInt(process.env.LOOP_MS || "60000", 10);
+const ENTRY_TF = process.env.ENTRY_TF || "5m";
+const TREND_TF = process.env.TREND_TF || "15m";
+
+const MIN_RR_SNIPER = parseFloat(process.env.MIN_RR_SNIPER || "2.0");
+const MIN_RR_TREND = parseFloat(process.env.MIN_RR_TREND || "1.7");
+
+const OKX = "https://www.okx.com";
 
 let symbols = [];
+let activeTrade = null;
 
-console.log("🔥 FINAL OKX SNIPER+TREND BOT START");
+console.log("🔥 V13 OKX PRO START");
 
-// ================= OKX FETCH =================
-async function getOKXSymbols() {
-  try {
-    const res = await fetch("https://www.okx.com/api/v5/public/instruments?instType=SWAP");
-    const json = await res.json();
+// ================== HELPERS ==================
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-    symbols = json.data
-      .filter(s => s.ctValCcy === "USDT")
-      .map(s => s.instId.replace("-", ""));
-
-    console.log("COIN COUNT:", symbols.length);
-  } catch (e) {
-    console.log("SYMBOL LOAD FAIL", e.message);
-  }
+function toOkx(sym) {
+  return sym.replace("USDT", "-USDT-SWAP");
 }
 
-async function getKlines(symbol, tf = "5m") {
-  try {
-    const instId = symbol.replace("USDT", "-USDT-SWAP");
+function barMap(tf){
+  if (tf === "1m") return "1m";
+  if (tf === "3m") return "3m";
+  if (tf === "5m") return "5m";
+  if (tf === "15m") return "15m";
+  if (tf === "30m") return "30m";
+  if (tf === "1h") return "1H";
+  return "5m";
+}
 
-    const res = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=${tf}&limit=100`);
-    const json = await res.json();
-
-    if (!json.data) return null;
-
-    return json.data.reverse().map(x => ({
-      open: parseFloat(x[1]),
-      high: parseFloat(x[2]),
-      low: parseFloat(x[3]),
-      close: parseFloat(x[4]),
-      volume: parseFloat(x[5])
-    }));
-
-  } catch {
+async function fetchJson(url){
+  try{
+    const ctrl = new AbortController();
+    const t = setTimeout(()=>ctrl.abort(), 8000);
+    const r = await fetch(url, { signal: ctrl.signal, headers: { "User-Agent": "Mozilla/5.0" }});
+    clearTimeout(t);
+    if(!r.ok) return null;
+    return await r.json();
+  }catch{
     return null;
   }
 }
 
-// ================= INDICATORS =================
-function ema(arr, p) {
-  let k = 2 / (p + 1);
-  let out = [arr[0]];
-  for (let i = 1; i < arr.length; i++) {
-    out.push(arr[i] * k + out[i - 1] * (1 - k));
+// ================== DATA ==================
+async function loadSymbols(){
+  const url = `${OKX}/api/v5/public/instruments?instType=SWAP`;
+  const j = await fetchJson(url);
+  if(!j || !Array.isArray(j.data)){
+    console.log("SYMBOL LOAD FAIL");
+    return;
+  }
+  symbols = j.data
+    .filter(s => s.ctValCcy === "USDT")
+    .map(s => s.instId.replace(/-/g,""));
+  console.log("SYMBOLS:", symbols.length);
+}
+
+async function klines(sym, tf=ENTRY_TF, limit=120){
+  const instId = toOkx(sym);
+  const bar = barMap(tf);
+  const url = `${OKX}/api/v5/market/candles?instId=${instId}&bar=${bar}&limit=${limit}`;
+  const j = await fetchJson(url);
+  if(!j || j.code !== "0" || !Array.isArray(j.data)) return null;
+
+  return j.data.slice().reverse().map(x => ({
+    o: +x[1], h: +x[2], l: +x[3], c: +x[4], v: +x[5]
+  }));
+}
+
+async function price(sym){
+  const instId = toOkx(sym);
+  const url = `${OKX}/api/v5/market/ticker?instId=${instId}`;
+  const j = await fetchJson(url);
+  if(!j || j.code !== "0" || !j.data?.[0]?.last) return null;
+  return +j.data[0].last;
+}
+
+// ================== INDICATORS ==================
+function ema(arr, p){
+  const k = 2/(p+1);
+  let e = arr[0];
+  const out = [e];
+  for(let i=1;i<arr.length;i++){
+    e = arr[i]*k + e*(1-k);
+    out.push(e);
   }
   return out;
 }
 
-function avg(arr) {
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
+function avg(a){ return a.reduce((x,y)=>x+y,0)/a.length; }
+
+function atr(d, p=14){
+  const tr = [];
+  for(let i=1;i<d.length;i++){
+    const {h,l} = d[i];
+    const pc = d[i-1].c;
+    tr.push(Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc)));
+  }
+  return avg(tr.slice(-p));
 }
 
-function rr(entry, stop, tp) {
-  return Math.abs(tp - entry) / Math.abs(entry - stop);
+function rr(entry, stop, tp){
+  const risk = Math.abs(entry-stop);
+  if(risk<=0) return 0;
+  return Math.abs(tp-entry)/risk;
 }
 
-// ================= SIGNAL =================
-async function checkSymbol(symbol) {
-  const data = await getKlines(symbol, "5m");
-  if (!data || data.length < 50) return null;
+function fmt(n){
+  if(!Number.isFinite(n)) return "-";
+  return Math.abs(n)>=1 ? n.toFixed(4) : n.toFixed(6);
+}
 
-  const closes = data.map(x => x.close);
-  const highs = data.map(x => x.high);
-  const lows = data.map(x => x.low);
-  const vols = data.map(x => x.volume);
+// ================== FILTERS ==================
+function fakePumpFilter(d){
+  const last = d.at(-1);
+  const body = Math.abs(last.c - last.o);
+  const range = Math.max(last.h - last.l, 1e-9);
+  const upperWick = last.h - Math.max(last.c, last.o);
+  const lowerWick = Math.min(last.c, last.o) - last.l;
 
-  const ema20 = ema(closes, 20);
-  const ema50 = ema(closes, 50);
+  // büyük fitil + küçük body ise reject
+  if(body/range < 0.25) return false;
+  if(upperWick/range > 0.5) return false;
+  if(lowerWick/range > 0.5) return false;
+  return true;
+}
 
-  const last = closes.at(-1);
-  const prev = closes.at(-2);
+function confidenceScore({trend, breakout, volume, momentum, nearEma}){
+  let s = 0;
+  if(trend) s += 3.0;
+  if(breakout) s += 2.0;
+  if(volume) s += 1.5;
+  if(momentum) s += 1.5;
+  if(nearEma) s += 1.0;
+  return Math.min(10, s);
+}
 
-  const avgVol = avg(vols.slice(-20));
-  const volNow = vols.at(-1);
+// ================== SCAN ==================
+async function scanSymbol(sym){
+  const d = await klines(sym, ENTRY_TF, 120);
+  if(!d || d.length<80) return null;
 
-  const volumeSpike = volNow > avgVol * 1.3;
-  if (!volumeSpike) return null;
+  const c = d.map(x=>x.c);
+  const h = d.map(x=>x.h);
+  const l = d.map(x=>x.l);
+  const v = d.map(x=>x.v);
 
-  const trendUp = ema20.at(-1) > ema50.at(-1);
-  const trendDown = ema20.at(-1) < ema50.at(-1);
+  const last = c.at(-1);
+  const prev = c.at(-2);
 
-  const recentHigh = Math.max(...highs.slice(-10));
-  const recentLow = Math.min(...lows.slice(-10));
+  const e20 = ema(c,20);
+  const e50 = ema(c,50);
+  const a = atr(d,14);
 
-  // ================= SNIPER =================
-  if (trendUp && prev < ema20.at(-2) && last > ema20.at(-1)) {
+  if(!a || (a/last)*100 < 0.12) return null;
+  if(!fakePumpFilter(d)) return null;
 
+  const volNow = v.at(-1);
+  const volAvg = avg(v.slice(-20));
+  const volOk = volNow > volAvg*1.2;
+
+  const trendUp = e20.at(-1) > e50.at(-1);
+  const trendDn = e20.at(-1) < e50.at(-1);
+
+  const recentHigh = Math.max(...h.slice(-10));
+  const recentLow  = Math.min(...l.slice(-10));
+
+  const breakoutUp = last > recentHigh;
+  const breakoutDn = last < recentLow;
+
+  const momentumUp = last > prev;
+  const momentumDn = last < prev;
+
+  const nearEma = Math.abs(last - e20.at(-1))/last < 0.01;
+
+  // ---------- SNIPER (pullback + continuation) ----------
+  if(trendUp && prev < e20.at(-2) && last > e20.at(-1) && volOk){
     const entry = last;
-    const stop = recentLow;
-    const tp1 = entry + (entry - stop) * 1.2;
-    const tp2 = entry + (entry - stop) * 2.2;
-
-    const r = rr(entry, stop, tp2);
-    if (r < 2.0) return null;
+    const stop = Math.min(...l.slice(-8));
+    const tp1 = entry + (entry - stop)*1.0;
+    const tp2 = entry + (entry - stop)*2.1;
+    const R = rr(entry, stop, tp2);
+    if(R < MIN_RR_SNIPER) return null;
 
     return {
       mode: "SNIPER",
       side: "LONG",
-      symbol,
-      entry,
-      stop,
-      tp1,
-      tp2,
-      rr: r
+      symbol: sym,
+      entry, stop, tp1, tp2, rr: R,
+      score: confidenceScore({trend:true, breakout:false, volume:volOk, momentum:momentumUp, nearEma})
     };
   }
 
-  if (trendDown && prev > ema20.at(-2) && last < ema20.at(-1)) {
-
+  if(trendDn && prev > e20.at(-2) && last < e20.at(-1) && volOk){
     const entry = last;
-    const stop = recentHigh;
-    const tp1 = entry - (stop - entry) * 1.2;
-    const tp2 = entry - (stop - entry) * 2.2;
-
-    const r = rr(entry, stop, tp2);
-    if (r < 2.0) return null;
+    const stop = Math.max(...h.slice(-8));
+    const tp1 = entry - (stop - entry)*1.0;
+    const tp2 = entry - (stop - entry)*2.1;
+    const R = rr(entry, stop, tp2);
+    if(R < MIN_RR_SNIPER) return null;
 
     return {
       mode: "SNIPER",
       side: "SHORT",
-      symbol,
-      entry,
-      stop,
-      tp1,
-      tp2,
-      rr: r
+      symbol: sym,
+      entry, stop, tp1, tp2, rr: R,
+      score: confidenceScore({trend:true, breakout:false, volume:volOk, momentum:momentumDn, nearEma})
     };
   }
 
-  // ================= TREND =================
-  if (trendUp && last > recentHigh) {
-
+  // ---------- TREND (breakout) ----------
+  if(trendUp && breakoutUp && volOk){
     const entry = last;
     const stop = recentLow;
-    const tp1 = entry + (entry - stop) * 1.0;
-    const tp2 = entry + (entry - stop) * 1.8;
-
-    const r = rr(entry, stop, tp2);
-    if (r < 1.8) return null;
+    const tp1 = entry + (entry - stop)*0.9;
+    const tp2 = entry + (entry - stop)*1.8;
+    const R = rr(entry, stop, tp2);
+    if(R < MIN_RR_TREND) return null;
 
     return {
       mode: "TREND",
       side: "LONG",
-      symbol,
-      entry,
-      stop,
-      tp1,
-      tp2,
-      rr: r
+      symbol: sym,
+      entry, stop, tp1, tp2, rr: R,
+      score: confidenceScore({trend:true, breakout:true, volume:volOk, momentum:momentumUp, nearEma})
     };
   }
 
-  if (trendDown && last < recentLow) {
-
+  if(trendDn && breakoutDn && volOk){
     const entry = last;
     const stop = recentHigh;
-    const tp1 = entry - (stop - entry) * 1.0;
-    const tp2 = entry - (stop - entry) * 1.8;
-
-    const r = rr(entry, stop, tp2);
-    if (r < 1.8) return null;
+    const tp1 = entry - (stop - entry)*0.9;
+    const tp2 = entry - (stop - entry)*1.8;
+    const R = rr(entry, stop, tp2);
+    if(R < MIN_RR_TREND) return null;
 
     return {
       mode: "TREND",
       side: "SHORT",
-      symbol,
-      entry,
-      stop,
-      tp1,
-      tp2,
-      rr: r
+      symbol: sym,
+      entry, stop, tp1, tp2, rr: R,
+      score: confidenceScore({trend:true, breakout:true, volume:volOk, momentum:momentumDn, nearEma})
     };
   }
 
   return null;
 }
 
-// ================= TELEGRAM =================
-async function send(msg) {
-  if (!TG_TOKEN || !CHAT_ID) return;
-
-  await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({
-      chat_id: CHAT_ID,
-      text: msg
-    })
+// ================== TELEGRAM ==================
+async function send(msg){
+  if(!TG_TOKEN || !CHAT_ID) return;
+  await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ chat_id: CHAT_ID, text: msg })
   });
 }
 
-// ================= MAIN =================
-async function run() {
+// ================== SMART EXIT ==================
+async function updateActive(){
+  if(!activeTrade) return;
 
-  let best = null;
+  const p = await price(activeTrade.symbol);
+  if(!p) return;
 
-  for (const s of symbols) {
-    const sig = await checkSymbol(s);
-    if (!sig) continue;
+  const e20Data = await klines(activeTrade.symbol, ENTRY_TF, 50);
+  if(!e20Data) return;
+  const e20 = ema(e20Data.map(x=>x.c),20).at(-1);
 
-    console.log("CANDIDATE:", sig.symbol, sig.mode, sig.rr.toFixed(2));
+  if(activeTrade.side==="LONG"){
+    if(!activeTrade.tp1Hit && p >= activeTrade.tp1){
+      activeTrade.tp1Hit = true;
+      activeTrade.stop = activeTrade.entry;
+      await send(`🟡 TP1 HIT / BE\n${activeTrade.symbol} LONG\n${fmt(p)}`);
+    }
+    if(p >= activeTrade.tp2){
+      await send(`🟢 TP2 HIT\n${activeTrade.symbol} LONG\n${fmt(p)}`);
+      activeTrade=null; return;
+    }
+    if(p <= activeTrade.stop || p < e20){
+      await send(`🔴 EXIT\n${activeTrade.symbol} LONG\n${fmt(p)}\nReason: STOP/EMA`);
+      activeTrade=null; return;
+    }
+  }else{
+    if(!activeTrade.tp1Hit && p <= activeTrade.tp1){
+      activeTrade.tp1Hit = true;
+      activeTrade.stop = activeTrade.entry;
+      await send(`🟡 TP1 HIT / BE\n${activeTrade.symbol} SHORT\n${fmt(p)}`);
+    }
+    if(p <= activeTrade.tp2){
+      await send(`🟢 TP2 HIT\n${activeTrade.symbol} SHORT\n${fmt(p)}`);
+      activeTrade=null; return;
+    }
+    if(p >= activeTrade.stop || p > e20){
+      await send(`🔴 EXIT\n${activeTrade.symbol} SHORT\n${fmt(p)}\nReason: STOP/EMA`);
+      activeTrade=null; return;
+    }
+  }
+}
 
-    if (!best || sig.rr > best.rr) best = sig;
+// ================== MAIN ==================
+async function run(){
+  await updateActive();
+  if(activeTrade) return;
+
+  let bestSniper=null, bestTrend=null;
+
+  for(const s of symbols){
+    const sig = await scanSymbol(s);
+    if(!sig) continue;
+
+    if(sig.mode==="SNIPER"){
+      if(!bestSniper || sig.score>bestSniper.score || sig.rr>bestSniper.rr){
+        bestSniper=sig;
+      }
+    }else{
+      if(!bestTrend || sig.score>bestTrend.score || sig.rr>bestTrend.rr){
+        bestTrend=sig;
+      }
+    }
   }
 
-  if (!best) {
+  const best = bestSniper || bestTrend;
+  if(!best){
     console.log("NO SIGNAL");
     return;
   }
 
-  const msg = `
-🔥 ${best.mode} SIGNAL
+  const msg = `🔥 ${best.mode} SIGNAL
 
 Coin: ${best.symbol}
 Side: ${best.side}
-
-Entry: ${best.entry.toFixed(4)}
-Stop: ${best.stop.toFixed(4)}
-TP1: ${best.tp1.toFixed(4)}
-TP2: ${best.tp2.toFixed(4)}
-
+Score: ${best.score.toFixed(1)}/10
 RR: ${best.rr.toFixed(2)}
+
+Entry: ${fmt(best.entry)}
+Stop: ${fmt(best.stop)}
+TP1: ${fmt(best.tp1)}
+TP2: ${fmt(best.tp2)}
 `;
 
-  console.log("SIGNAL:", best.symbol, best.mode);
   await send(msg);
+
+  activeTrade = { ...best, tp1Hit:false };
 }
 
-// ================= LOOP =================
-(async () => {
-  await getOKXSymbols();
+// ================== LOOP ==================
+(async()=>{
+  await loadSymbols();
 
-  while (true) {
-    try {
-      await run();
-    } catch (e) {
-      console.log("ERROR:", e.message);
-    }
+  while(true){
+    try{ await run(); }
+    catch(e){ console.log("ERR", e.message); }
 
-    await new Promise(r => setTimeout(r, LOOP_MS));
+    await sleep(LOOP_MS);
   }
 })();
