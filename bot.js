@@ -2,16 +2,10 @@ const TG_TOKEN = process.env.TG_BOT_TOKEN;
 const CHAT_ID = process.env.TG_CHAT_ID;
 
 const ENTRY_TF = process.env.ENTRY_TF || "5m";
-const TREND_TF = process.env.TREND_TF || "15m";
-const HTF = process.env.HTF || "1h";
+const LOOP_MS = parseInt(process.env.LOOP_MS || "60000", 10);
 
-const MIN_SCORE_SNIPER = parseFloat(process.env.MIN_SCORE_SNIPER || "7.0");
-const MIN_SCORE_TREND = parseFloat(process.env.MIN_SCORE_TREND || "6.0");
-
-const MIN_RR_SNIPER = parseFloat(process.env.MIN_RR_SNIPER || "2.0");
-const MIN_RR_TREND = parseFloat(process.env.MIN_RR_TREND || "1.5");
-
-const LOOP_MS = parseInt(process.env.LOOP_MS || "90000", 10);
+const MIN_SCORE = 4.5;
+const MIN_RR = 1.3;
 
 const BASE = "https://fapi.binance.com";
 
@@ -22,160 +16,139 @@ const COINS = (process.env.COIN_LIST || "")
 
 let activeTrade = null;
 
-console.log("🚀 BOT START");
+console.log("🔥 V10 BALANCED START");
 console.log("COIN COUNT:", COINS.length);
 
 async function fetchJson(url) {
   try {
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    return await res.json();
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return await r.json();
   } catch {
     return null;
   }
 }
 
-async function klines(symbol, tf) {
-  return await fetchJson(`${BASE}/fapi/v1/klines?symbol=${symbol}&interval=${tf}&limit=120`);
+async function klines(symbol) {
+  return await fetchJson(`${BASE}/fapi/v1/klines?symbol=${symbol}&interval=${ENTRY_TF}&limit=120`);
 }
 
-function closes(k) { return k.map(x => parseFloat(x[4])); }
-function highs(k) { return k.map(x => parseFloat(x[2])); }
-function lows(k) { return k.map(x => parseFloat(x[3])); }
-function volumes(k) { return k.map(x => parseFloat(x[5])); }
+function closes(d){return d.map(x=>+x[4]);}
+function highs(d){return d.map(x=>+x[2]);}
+function lows(d){return d.map(x=>+x[3]);}
+function volumes(d){return d.map(x=>+x[5]);}
 
-function ema(arr, p) {
-  const k = 2 / (p + 1);
-  let prev = arr[0];
-  return arr.map(v => (prev = v * k + prev * (1 - k)));
+function ema(a,p){
+  let k=2/(p+1),e=a[0];
+  return a.map(v=>e=v*k+e*(1-k));
 }
 
-function avg(a) { return a.reduce((x, y) => x + y, 0) / a.length; }
+function avg(a){return a.reduce((x,y)=>x+y,0)/a.length;}
 
-function rr(entry, stop, tp) {
-  return Math.abs(tp - entry) / Math.abs(entry - stop);
-}
+function rr(e,s,tp){return Math.abs(tp-e)/Math.abs(e-s);}
 
-function fmt(n) {
-  return n.toFixed(4);
-}
+function fmt(n){return n.toFixed(4);}
 
-async function send(msg) {
-  if (!TG_TOKEN || !CHAT_ID) return;
-  await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({ chat_id: CHAT_ID, text: msg })
+async function send(msg){
+  if(!TG_TOKEN||!CHAT_ID)return;
+  await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({chat_id:CHAT_ID,text:msg})
   });
 }
 
-async function scan(symbol) {
-  const data = await klines(symbol, ENTRY_TF);
-  if (!data) return null;
+async function scan(symbol){
+  const d = await klines(symbol);
+  if(!d) return null;
 
-  const c = closes(data);
-  const h = highs(data);
-  const l = lows(data);
-  const v = volumes(data);
+  const c=closes(d),h=highs(d),l=lows(d),v=volumes(d);
+  const last=c.at(-1);
 
-  const last = c.at(-1);
+  const breakoutHigh = Math.max(...h.slice(-11,-1));
+  const breakoutLow  = Math.min(...l.slice(-11,-1));
 
-  // 🔥 FIXED BREAKOUT
-  const breakoutHigh = Math.max(...h.slice(-11, -1));
-  const breakoutLow = Math.min(...l.slice(-11, -1));
-
-  const ema20 = ema(c, 20).at(-1);
+  const ema20 = ema(c,20).at(-1);
 
   const volNow = v.at(-1);
-  const volAvg = avg(v.slice(-20, -1));
+  const volAvg = avg(v.slice(-20,-1));
 
-  const volumeOk = volNow > volAvg * 1.2;
+  let longScore=0, shortScore=0;
 
-  let longScore = 0;
-  let shortScore = 0;
+  // 🔥 breakout (gevşetildi)
+  if(last > breakoutHigh*0.998) longScore+=2.5;
+  if(last < breakoutLow*1.002) shortScore+=2.5;
 
-  if (last > breakoutHigh) longScore += 4;
-  if (last < breakoutLow) shortScore += 4;
-
-  if (volumeOk) {
-    longScore += 2;
-    shortScore += 2;
+  // 🔥 volume (gevşetildi)
+  if(volNow > volAvg*1.05){
+    longScore+=1.5;
+    shortScore+=1.5;
   }
 
-  if (Math.abs(last - ema20) / last < 0.01) {
-    longScore += 1;
-    shortScore += 1;
+  // 🔥 EMA yakınlık
+  if(Math.abs(last-ema20)/last < 0.015){
+    longScore+=1;
+    shortScore+=1;
   }
+
+  // 🔥 mini momentum
+  if(c.at(-1) > c.at(-3)) longScore+=0.5;
+  if(c.at(-1) < c.at(-3)) shortScore+=0.5;
 
   // DEBUG
-  if (longScore > 0 || shortScore > 0) {
-    console.log(symbol, "SCORE:", longScore, shortScore);
+  if(longScore>2 || shortScore>2){
+    console.log(symbol,"SCORE",longScore,shortScore);
   }
 
-  if (longScore >= MIN_SCORE_SNIPER) {
+  if(longScore>=MIN_SCORE){
     const stop = breakoutLow;
-    const tp = last + (last - stop) * 2;
+    const tp = last + (last-stop)*1.5;
 
-    if (rr(last, stop, tp) < MIN_RR_SNIPER) return null;
+    if(rr(last,stop,tp)<MIN_RR) return null;
 
-    return {
-      coin: symbol,
-      side: "LONG",
-      entry: last,
-      stop,
-      tp,
-      score: longScore
-    };
+    return {coin:symbol,side:"LONG",entry:last,stop,tp,score:longScore};
   }
 
-  if (shortScore >= MIN_SCORE_SNIPER) {
+  if(shortScore>=MIN_SCORE){
     const stop = breakoutHigh;
-    const tp = last - (stop - last) * 2;
+    const tp = last - (stop-last)*1.5;
 
-    if (rr(last, stop, tp) < MIN_RR_SNIPER) return null;
+    if(rr(last,stop,tp)<MIN_RR) return null;
 
-    return {
-      coin: symbol,
-      side: "SHORT",
-      entry: last,
-      stop,
-      tp,
-      score: shortScore
-    };
+    return {coin:symbol,side:"SHORT",entry:last,stop,tp,score:shortScore};
   }
 
   return null;
 }
 
-async function run() {
+async function run(){
   console.log("RUN");
 
-  if (!COINS.length) {
-    console.log("❌ COIN LIST EMPTY");
+  if(!COINS.length){
+    console.log("COIN EMPTY");
     return;
   }
 
-  if (activeTrade) {
-    console.log("ACTIVE TRADE WAIT");
+  if(activeTrade){
+    console.log("WAIT ACTIVE");
     return;
   }
 
-  let best = null;
+  let best=null;
 
-  for (const coin of COINS) {
+  for(const coin of COINS){
     const s = await scan(coin);
-
-    if (s && (!best || s.score > best.score)) {
-      best = s;
+    if(s && (!best || s.score>best.score)){
+      best=s;
     }
   }
 
-  if (!best) {
+  if(!best){
     console.log("NO SIGNAL");
     return;
   }
 
-  console.log("SIGNAL:", best.coin, best.side);
+  console.log("SIGNAL",best.coin,best.side);
 
   await send(`🔥 SIGNAL
 
@@ -185,18 +158,13 @@ Stop: ${fmt(best.stop)}
 TP: ${fmt(best.tp)}
 Score: ${best.score}`);
 
-  activeTrade = best;
+  activeTrade=best;
 }
 
-async function main() {
-  while (true) {
-    try {
-      await run();
-    } catch (e) {
-      console.log("ERR", e);
-    }
-
-    await new Promise(r => setTimeout(r, LOOP_MS));
+async function main(){
+  while(true){
+    try{await run();}catch(e){console.log(e);}
+    await new Promise(r=>setTimeout(r,LOOP_MS));
   }
 }
 
