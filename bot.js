@@ -5,16 +5,15 @@ const ENTRY_TF = process.env.ENTRY_TF || "5m";
 const TREND_TF = process.env.TREND_TF || "15m";
 const HTF = process.env.HTF || "1h";
 
-const MIN_SCORE_SNIPER = parseFloat(process.env.MIN_SCORE_SNIPER || "6.5");
-const MIN_SCORE_TREND = parseFloat(process.env.MIN_SCORE_TREND || "5.5");
+const MIN_SCORE_SNIPER = parseFloat(process.env.MIN_SCORE_SNIPER || "7.0");
+const MIN_SCORE_TREND = parseFloat(process.env.MIN_SCORE_TREND || "6.0");
 
-const MIN_RR_SNIPER = parseFloat(process.env.MIN_RR_SNIPER || "1.8");
+const MIN_RR_SNIPER = parseFloat(process.env.MIN_RR_SNIPER || "2.0");
 const MIN_RR_TREND = parseFloat(process.env.MIN_RR_TREND || "1.5");
 
-const LOOP_MS = parseInt(process.env.LOOP_MS || "60000", 10);
-const DUPLICATE_TTL_MS = parseInt(process.env.DUPLICATE_TTL_MS || "1800000", 10);
+const LOOP_MS = parseInt(process.env.LOOP_MS || "90000", 10);
 
-const BASE_URL = "https://fapi.binance.com";
+const BASE = "https://fapi.binance.com";
 
 const COINS = (process.env.COIN_LIST || "")
   .split(",")
@@ -22,15 +21,13 @@ const COINS = (process.env.COIN_LIST || "")
   .filter(Boolean);
 
 let activeTrade = null;
-const lastSignalAt = new Map();
 
-console.log("V9 BALANCED BOT STARTED");
+console.log("🚀 BOT START");
 console.log("COIN COUNT:", COINS.length);
 
-// ===== HELPERS =====
-async function fetchJson(path) {
+async function fetchJson(url) {
   try {
-    const res = await fetch(BASE_URL + path);
+    const res = await fetch(url);
     if (!res.ok) return null;
     return await res.json();
   } catch {
@@ -38,162 +35,168 @@ async function fetchJson(path) {
   }
 }
 
-async function fetchKlines(symbol, interval, limit = 100) {
-  return await fetchJson(`/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+async function klines(symbol, tf) {
+  return await fetchJson(`${BASE}/fapi/v1/klines?symbol=${symbol}&interval=${tf}&limit=120`);
 }
 
-async function fetchPrice(symbol) {
-  const d = await fetchJson(`/fapi/v1/ticker/price?symbol=${symbol}`);
-  return d ? parseFloat(d.price) : null;
-}
-
-const closes = d => d.map(x => parseFloat(x[4]));
-const highs = d => d.map(x => parseFloat(x[2]));
-const lows = d => d.map(x => parseFloat(x[3]));
-const volumes = d => d.map(x => parseFloat(x[5]));
+function closes(k) { return k.map(x => parseFloat(x[4])); }
+function highs(k) { return k.map(x => parseFloat(x[2])); }
+function lows(k) { return k.map(x => parseFloat(x[3])); }
+function volumes(k) { return k.map(x => parseFloat(x[5])); }
 
 function ema(arr, p) {
-  const k = 2/(p+1);
-  let e = arr[0];
-  return arr.map(v => (e = v*k + e*(1-k)));
+  const k = 2 / (p + 1);
+  let prev = arr[0];
+  return arr.map(v => (prev = v * k + prev * (1 - k)));
 }
 
-function avg(a){ return a.reduce((x,y)=>x+y,0)/a.length }
+function avg(a) { return a.reduce((x, y) => x + y, 0) / a.length; }
 
-function rr(e,s,tp){ return Math.abs(tp-e)/Math.abs(e-s) }
-
-function send(msg){
-  return fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{
-    method:"POST",
-    headers:{ "Content-Type":"application/json"},
-    body:JSON.stringify({chat_id:CHAT_ID,text:msg})
-  })
+function rr(entry, stop, tp) {
+  return Math.abs(tp - entry) / Math.abs(entry - stop);
 }
 
-// ===== SNIPER (gevşetildi) =====
-async function checkSniper(symbol){
-  const d = await fetchKlines(symbol, ENTRY_TF);
-  if(!d) return null;
-
-  const c = closes(d);
-  const h = highs(d);
-  const l = lows(d);
-  const v = volumes(d);
-
-  const ema20 = ema(c,20);
-
-  const last = c.at(-1);
-  const prev = c.at(-2);
-
-  const avgVol = avg(v.slice(-20));
-  const volSpike = v.at(-1) > avgVol * 1.1; // gevşetildi
-
-  const nearEMA = Math.abs(last - ema20.at(-1))/last < 0.01; // gevşetildi
-
-  const breakoutHigh = Math.max(...h.slice(-10));
-  const breakoutLow = Math.min(...l.slice(-10));
-
-  let score = 0;
-
-  if(last > breakoutHigh) score += 3;
-  if(last < breakoutLow) score += 3;
-
-  if(volSpike) score += 1.5;
-  if(nearEMA) score += 1;
-
-  if(Math.abs(last-prev)/last > 0.002) score += 1.5;
-
-  if(score < MIN_SCORE_SNIPER) return null;
-
-  const side = last > breakoutHigh ? "LONG" : "SHORT";
-
-  const stop = side==="LONG" ? last*0.99 : last*1.01;
-  const tp2 = side==="LONG" ? last*1.02 : last*0.98;
-
-  if(rr(last,stop,tp2) < MIN_RR_SNIPER) return null;
-
-  return {mode:"SNIPER",coin:symbol,side,score,entry:last,stop,tp2};
+function fmt(n) {
+  return n.toFixed(4);
 }
 
-// ===== TREND (aktif edildi) =====
-async function checkTrend(symbol){
-  const d = await fetchKlines(symbol, TREND_TF);
-  if(!d) return null;
+async function send(msg) {
+  if (!TG_TOKEN || !CHAT_ID) return;
+  await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ chat_id: CHAT_ID, text: msg })
+  });
+}
 
-  const c = closes(d);
-  const ema20 = ema(c,20);
-  const ema50 = ema(c,50);
+async function scan(symbol) {
+  const data = await klines(symbol, ENTRY_TF);
+  if (!data) return null;
+
+  const c = closes(data);
+  const h = highs(data);
+  const l = lows(data);
+  const v = volumes(data);
 
   const last = c.at(-1);
 
-  let score = 0;
+  // 🔥 FIXED BREAKOUT
+  const breakoutHigh = Math.max(...h.slice(-11, -1));
+  const breakoutLow = Math.min(...l.slice(-11, -1));
 
-  if(ema20.at(-1) > ema50.at(-1)) score += 3;
-  if(ema20.at(-1) < ema50.at(-1)) score += 3;
+  const ema20 = ema(c, 20).at(-1);
 
-  if(Math.abs(c.at(-1)-c.at(-5))/last > 0.005) score += 2;
+  const volNow = v.at(-1);
+  const volAvg = avg(v.slice(-20, -1));
 
-  if(score < MIN_SCORE_TREND) return null;
+  const volumeOk = volNow > volAvg * 1.2;
 
-  const side = ema20.at(-1) > ema50.at(-1) ? "LONG" : "SHORT";
+  let longScore = 0;
+  let shortScore = 0;
 
-  const stop = side==="LONG" ? last*0.995 : last*1.005;
-  const tp2 = side==="LONG" ? last*1.015 : last*0.985;
+  if (last > breakoutHigh) longScore += 4;
+  if (last < breakoutLow) shortScore += 4;
 
-  if(rr(last,stop,tp2) < MIN_RR_TREND) return null;
+  if (volumeOk) {
+    longScore += 2;
+    shortScore += 2;
+  }
 
-  return {mode:"TREND",coin:symbol,side,score,entry:last,stop,tp2};
+  if (Math.abs(last - ema20) / last < 0.01) {
+    longScore += 1;
+    shortScore += 1;
+  }
+
+  // DEBUG
+  if (longScore > 0 || shortScore > 0) {
+    console.log(symbol, "SCORE:", longScore, shortScore);
+  }
+
+  if (longScore >= MIN_SCORE_SNIPER) {
+    const stop = breakoutLow;
+    const tp = last + (last - stop) * 2;
+
+    if (rr(last, stop, tp) < MIN_RR_SNIPER) return null;
+
+    return {
+      coin: symbol,
+      side: "LONG",
+      entry: last,
+      stop,
+      tp,
+      score: longScore
+    };
+  }
+
+  if (shortScore >= MIN_SCORE_SNIPER) {
+    const stop = breakoutHigh;
+    const tp = last - (stop - last) * 2;
+
+    if (rr(last, stop, tp) < MIN_RR_SNIPER) return null;
+
+    return {
+      coin: symbol,
+      side: "SHORT",
+      entry: last,
+      stop,
+      tp,
+      score: shortScore
+    };
+  }
+
+  return null;
 }
 
-// ===== MAIN =====
-async function run(){
+async function run() {
+  console.log("RUN");
 
-  if(activeTrade) return;
+  if (!COINS.length) {
+    console.log("❌ COIN LIST EMPTY");
+    return;
+  }
+
+  if (activeTrade) {
+    console.log("ACTIVE TRADE WAIT");
+    return;
+  }
 
   let best = null;
 
-  for(const coin of COINS){
+  for (const coin of COINS) {
+    const s = await scan(coin);
 
-    const s = await checkSniper(coin);
-    if(s && (!best || s.score > best.score)){
+    if (s && (!best || s.score > best.score)) {
       best = s;
-      continue;
-    }
-
-    const t = await checkTrend(coin);
-    if(!best && t && (!best || t.score > best.score)){
-      best = t;
     }
   }
 
-  if(!best){
+  if (!best) {
     console.log("NO SIGNAL");
     return;
   }
 
-  console.log("SIGNAL:", best);
+  console.log("SIGNAL:", best.coin, best.side);
 
-  await send(`🔥 ${best.mode}
+  await send(`🔥 SIGNAL
+
 ${best.coin} ${best.side}
-Score: ${best.score}
-Entry: ${best.entry}`);
+Entry: ${fmt(best.entry)}
+Stop: ${fmt(best.stop)}
+TP: ${fmt(best.tp)}
+Score: ${best.score}`);
 
   activeTrade = best;
 }
 
-async function main(){
-  if(!TG_TOKEN || !CHAT_ID || !COINS.length){
-    console.log("ENV ERROR");
-    return;
-  }
-
-  while(true){
-    try{
+async function main() {
+  while (true) {
+    try {
       await run();
-    }catch(e){
-      console.log(e);
+    } catch (e) {
+      console.log("ERR", e);
     }
-    await new Promise(r=>setTimeout(r,LOOP_MS));
+
+    await new Promise(r => setTimeout(r, LOOP_MS));
   }
 }
 
