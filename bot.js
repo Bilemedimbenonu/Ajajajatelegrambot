@@ -3,15 +3,15 @@ const CHAT_ID = process.env.TG_CHAT_ID;
 
 const LOOP_MS = 60000;
 
-const MIN_RR_SNIPER = 2.5;
-const MIN_RR_TREND = 2.2;
+const MIN_SCORE = 8;
+const MIN_RR = 2.8;
 
 const OKX = "https://www.okx.com";
 
 let symbols = [];
 let activeTrade = null;
 
-console.log("🔥 V14 ELITE MODE START");
+console.log("🔥 V15 ULTRA MODE START");
 
 // ================= FETCH =================
 async function fetchJson(url){
@@ -81,19 +81,39 @@ function rr(e,s,tp){
   return Math.abs(tp-e)/Math.abs(e-s);
 }
 
+// ================= SCORE =================
+function calcScore({rr, volRatio, trend, momentum}){
+
+  let score = 0;
+
+  // RR
+  if(rr > 3.5) score += 3;
+  else if(rr > 3) score += 2.5;
+  else if(rr > 2.8) score += 2;
+
+  // volume
+  if(volRatio > 2) score += 2;
+  else if(volRatio > 1.6) score += 1.5;
+
+  // trend
+  if(trend === "strong") score += 2;
+
+  // momentum
+  if(momentum === "strong") score += 2;
+
+  // bonus
+  score += 1;
+
+  return Math.min(10, parseFloat(score.toFixed(1)));
+}
+
 // ================= FILTER =================
-function fakeBreakoutFilter(d){
+function cleanCandle(d){
   const last=d.at(-1);
   const body=Math.abs(last.c-last.o);
   const range=last.h-last.l;
 
-  const upper=last.h-Math.max(last.c,last.o);
-  const lower=Math.min(last.c,last.o)-last.l;
-
-  if(body/range < 0.3) return false;
-  if(upper/range > 0.5) return false;
-  if(lower/range > 0.5) return false;
-
+  if(body/range < 0.35) return false;
   return true;
 }
 
@@ -104,117 +124,100 @@ async function scan(sym){
   const d15 = await klines(sym,"15m");
 
   if(!d5 || !d15) return null;
-  if(d5.length < 80 || d15.length < 80) return null;
+  if(d5.length<80 || d15.length<80) return null;
 
-  if(!fakeBreakoutFilter(d5)) return null;
+  if(!cleanCandle(d5)) return null;
 
-  const c5 = d5.map(x=>x.c);
-  const c15 = d15.map(x=>x.c);
-  const v = d5.map(x=>x.v);
+  const c5=d5.map(x=>x.c);
+  const c15=d15.map(x=>x.c);
+  const v=d5.map(x=>x.v);
 
-  const e20_5 = ema(c5,20);
-  const e50_5 = ema(c5,50);
+  const e20_5=ema(c5,20);
+  const e50_5=ema(c5,50);
 
-  const e20_15 = ema(c15,20);
-  const e50_15 = ema(c15,50);
+  const e20_15=ema(c15,20);
+  const e50_15=ema(c15,50);
 
-  const last = c5.at(-1);
-  const prev = c5.at(-2);
+  const last=c5.at(-1);
+  const prev=c5.at(-2);
 
-  const volNow = v.at(-1);
-  const volAvg = avg(v.slice(-20));
+  const volNow=v.at(-1);
+  const volAvg=avg(v.slice(-20));
+  const volRatio=volNow/volAvg;
 
-  const atrVal = atr(d5);
+  const atrVal=atr(d5);
 
-  // 🔥 ELITE FILTERS
-  if((atrVal/last)*100 < 0.25) return null; // volatilite düşük → skip
-  if(volNow < volAvg*1.5) return null;      // volume düşük → skip
+  if((atrVal/last)*100 < 0.3) return null;
+  if(volRatio < 1.6) return null;
 
-  const trendUp = e20_5.at(-1)>e50_5.at(-1) && e20_15.at(-1)>e50_15.at(-1);
-  const trendDn = e20_5.at(-1)<e50_5.at(-1) && e20_15.at(-1)<e50_15.at(-1);
+  const trendUp=e20_5.at(-1)>e50_5.at(-1) && e20_15.at(-1)>e50_15.at(-1);
+  const trendDn=e20_5.at(-1)<e50_5.at(-1) && e20_15.at(-1)<e50_15.at(-1);
 
-  const momentumUp = last > prev;
-  const momentumDn = last < prev;
+  const momentumUp=last>prev;
+  const momentumDn=last<prev;
 
   // ================= SNIPER =================
-  if(trendUp && prev < e20_5.at(-2) && last > e20_5.at(-1) && momentumUp){
+  if(trendUp && prev<e20_5.at(-2) && last>e20_5.at(-1) && momentumUp){
 
-    const entry = last;
-    const stop = Math.min(...d5.slice(-10).map(x=>x.l));
-
-    const tp1 = entry + (entry - stop)*1.2;
-    const tp2 = entry + (entry - stop)*2.6;
-
-    const R = rr(entry,stop,tp2);
-    if(R < MIN_RR_SNIPER) return null;
-
-    return {
-      mode:"SNIPER",
-      side:"LONG",
-      symbol:sym,
-      entry,stop,tp1,tp2,rr:R,score:9
-    };
-  }
-
-  if(trendDn && prev > e20_5.at(-2) && last < e20_5.at(-1) && momentumDn){
-
-    const entry = last;
-    const stop = Math.max(...d5.slice(-10).map(x=>x.h));
-
-    const tp1 = entry - (stop-entry)*1.2;
-    const tp2 = entry - (stop-entry)*2.6;
-
-    const R = rr(entry,stop,tp2);
-    if(R < MIN_RR_SNIPER) return null;
-
-    return {
-      mode:"SNIPER",
-      side:"SHORT",
-      symbol:sym,
-      entry,stop,tp1,tp2,rr:R,score:9
-    };
-  }
-
-  // ================= TREND =================
-  if(trendUp){
     const entry=last;
-    const stop=Math.min(...d5.slice(-12).map(x=>x.l));
+    const stop=Math.min(...d5.slice(-10).map(x=>x.l));
 
-    const tp2=entry+(entry-stop)*2.2;
+    const tp2=entry+(entry-stop)*2.8;
     const R=rr(entry,stop,tp2);
 
-    if(R<MIN_RR_TREND) return null;
+    if(R < MIN_RR) return null;
+
+    const score = calcScore({
+      rr:R,
+      volRatio,
+      trend:"strong",
+      momentum:"strong"
+    });
+
+    if(score < MIN_SCORE) return null;
 
     return {
-      mode:"TREND",
+      mode:"ULTRA SNIPER",
       side:"LONG",
       symbol:sym,
-      entry,stop,
-      tp1:entry+(entry-stop),
+      entry,
+      stop,
+      tp1:entry+(entry-stop)*1.2,
       tp2,
       rr:R,
-      score:7
+      score
     };
   }
 
-  if(trendDn){
-    const entry=last;
-    const stop=Math.max(...d5.slice(-12).map(x=>x.h));
+  if(trendDn && prev>e20_5.at(-2) && last<e20_5.at(-1) && momentumDn){
 
-    const tp2=entry-(stop-entry)*2.2;
+    const entry=last;
+    const stop=Math.max(...d5.slice(-10).map(x=>x.h));
+
+    const tp2=entry-(stop-entry)*2.8;
     const R=rr(entry,stop,tp2);
 
-    if(R<MIN_RR_TREND) return null;
+    if(R < MIN_RR) return null;
+
+    const score = calcScore({
+      rr:R,
+      volRatio,
+      trend:"strong",
+      momentum:"strong"
+    });
+
+    if(score < MIN_SCORE) return null;
 
     return {
-      mode:"TREND",
+      mode:"ULTRA SNIPER",
       side:"SHORT",
       symbol:sym,
-      entry,stop,
-      tp1:entry-(stop-entry),
+      entry,
+      stop,
+      tp1:entry-(stop-entry)*1.2,
       tp2,
       rr:R,
-      score:7
+      score
     };
   }
 
@@ -233,7 +236,7 @@ async function send(msg){
 // ================= EXIT =================
 async function update(){
 
-  if(!activeTrade) return;
+  if(!activeTrade || !activeTrade.stop) return;
 
   const p = await price(activeTrade.symbol);
   if(!p) return;
@@ -283,31 +286,25 @@ async function run(){
 
   if(activeTrade) return;
 
-  let bestSniper=null;
-  let bestTrend=null;
+  let best=null;
 
   for(const s of symbols){
 
     const sig=await scan(s);
     if(!sig) continue;
 
-    if(sig.mode==="SNIPER"){
-      if(!bestSniper || sig.rr>bestSniper.rr) bestSniper=sig;
-    }else{
-      if(!bestTrend || sig.rr>bestTrend.rr) bestTrend=sig;
-    }
+    if(!best || sig.rr>best.rr) best=sig;
   }
-
-  const best = bestSniper || bestTrend;
 
   if(!best){
     console.log("NO SIGNAL");
     return;
   }
 
-  await send(`🔥 ${best.mode}
+  await send(`🚀 ULTRA SIGNAL
 
 ${best.symbol} ${best.side}
+Score: ${best.score}/10
 RR: ${best.rr.toFixed(2)}
 
 Entry: ${best.entry}
@@ -320,17 +317,12 @@ Stop: ${best.stop}`);
 
 // ================= LOOP =================
 (async()=>{
-
   await loadSymbols();
 
   while(true){
-    try{
-      await run();
-    }catch(e){
-      console.log("ERR",e.message);
-    }
+    try{ await run(); }
+    catch(e){ console.log("ERR",e.message); }
 
     await new Promise(r=>setTimeout(r,LOOP_MS));
   }
-
 })();
