@@ -2,6 +2,7 @@ const TG_TOKEN = process.env.TG_BOT_TOKEN;
 const CHAT_ID = process.env.TG_CHAT_ID;
 
 const LOOP_MS = parseInt(process.env.LOOP_MS || "60000", 10);
+const COOLDOWN_MS = parseInt(process.env.COOLDOWN_MS || "5400000", 10); // 90 dk
 
 const MIN_SCORE = 8.2;
 const MIN_RR = 2.6;
@@ -9,9 +10,9 @@ const MIN_RR = 2.6;
 const OKX = "https://www.okx.com";
 
 let symbols = [];
-let activeTrade = null;
+const lastSignalAt = new Map();
 
-console.log("🔥 V16 ULTRA HYBRID STOP START");
+console.log("🔥 V17 ULTRA NO-LOCK START");
 
 async function fetchJson(url) {
   try {
@@ -27,6 +28,7 @@ async function fetchJson(url) {
 
 async function loadSymbols() {
   const j = await fetchJson(`${OKX}/api/v5/public/instruments?instType=SWAP`);
+
   if (!j || !Array.isArray(j.data)) {
     console.log("SYMBOL LOAD FAIL");
     return;
@@ -59,15 +61,6 @@ async function klines(sym, tf = "5m") {
   }));
 }
 
-async function price(sym) {
-  const j = await fetchJson(
-    `${OKX}/api/v5/market/ticker?instId=${toOkx(sym)}`
-  );
-
-  if (!j || j.code !== "0" || !j.data?.[0]?.last) return null;
-  return +j.data[0].last;
-}
-
 function ema(arr, p) {
   const k = 2 / (p + 1);
   let e = arr[0];
@@ -81,6 +74,7 @@ function avg(a) {
 
 function atr(d) {
   const tr = [];
+
   for (let i = 1; i < d.length; i++) {
     tr.push(Math.max(
       d[i].h - d[i].l,
@@ -88,6 +82,7 @@ function atr(d) {
       Math.abs(d[i].l - d[i - 1].c)
     ));
   }
+
   return avg(tr.slice(-14));
 }
 
@@ -132,6 +127,20 @@ function calcScore({ R, volRatio, trendStrong, momentum }) {
   score += 1;
 
   return Math.min(10, Number(score.toFixed(1)));
+}
+
+function isDuplicate(sig) {
+  const key = `${sig.symbol}:${sig.side}`;
+  const last = lastSignalAt.get(key);
+
+  if (!last) return false;
+
+  return Date.now() - last < COOLDOWN_MS;
+}
+
+function markSignal(sig) {
+  const key = `${sig.symbol}:${sig.side}`;
+  lastSignalAt.set(key, Date.now());
 }
 
 async function send(msg) {
@@ -196,14 +205,11 @@ async function scan(sym) {
   const momentumUp = last > prev && prev > prev2;
   const momentumDown = last < prev && prev < prev2;
 
-  // LONG SNIPER
   if (trendUp && prev < e20_5.at(-2) && last > e20_5.at(-1) && momentumUp) {
     const entry = last;
 
     const swingStop = Math.min(...d5.slice(-10).map(x => x.l));
     const atrStop = entry - atrVal * 1.6;
-
-    // Daha geniş olan stop kullanılır
     const stop = Math.min(swingStop, atrStop);
 
     const tp1 = entry + (entry - stop) * 1.2;
@@ -234,14 +240,11 @@ async function scan(sym) {
     };
   }
 
-  // SHORT SNIPER
   if (trendDown && prev > e20_5.at(-2) && last < e20_5.at(-1) && momentumDown) {
     const entry = last;
 
     const swingStop = Math.max(...d5.slice(-10).map(x => x.h));
     const atrStop = entry + atrVal * 1.6;
-
-    // Daha geniş olan stop kullanılır
     const stop = Math.max(swingStop, atrStop);
 
     const tp1 = entry - (stop - entry) * 1.2;
@@ -275,111 +278,23 @@ async function scan(sym) {
   return null;
 }
 
-async function update() {
-  if (
-    !activeTrade ||
-    !activeTrade.symbol ||
-    !Number.isFinite(activeTrade.entry) ||
-    !Number.isFinite(activeTrade.stop) ||
-    !Number.isFinite(activeTrade.tp1) ||
-    !Number.isFinite(activeTrade.tp2)
-  ) {
-    return;
-  }
-
-  const t = activeTrade;
-  const p = await price(t.symbol);
-  if (!p) return;
-
-  if (t.side === "LONG") {
-    if (!t.tp1Hit && p >= t.tp1) {
-      t.tp1Hit = true;
-      t.stop = t.entry;
-      activeTrade = t;
-
-      await send(`🟡 TP1 HIT / STOP BE
-
-${t.symbol} LONG
-Live: ${fmt(p)}
-Stop moved to entry.`);
-      return;
-    }
-
-    if (p >= t.tp2) {
-      await send(`🟢 TP2 HIT
-
-${t.symbol} LONG
-Live: ${fmt(p)}`);
-      activeTrade = null;
-      return;
-    }
-
-    if (p <= t.stop) {
-      await send(`🔴 STOP / EXIT
-
-${t.symbol} LONG
-Live: ${fmt(p)}
-Stop: ${fmt(t.stop)}`);
-      activeTrade = null;
-      return;
-    }
-  }
-
-  if (t.side === "SHORT") {
-    if (!t.tp1Hit && p <= t.tp1) {
-      t.tp1Hit = true;
-      t.stop = t.entry;
-      activeTrade = t;
-
-      await send(`🟡 TP1 HIT / STOP BE
-
-${t.symbol} SHORT
-Live: ${fmt(p)}
-Stop moved to entry.`);
-      return;
-    }
-
-    if (p <= t.tp2) {
-      await send(`🟢 TP2 HIT
-
-${t.symbol} SHORT
-Live: ${fmt(p)}`);
-      activeTrade = null;
-      return;
-    }
-
-    if (p >= t.stop) {
-      await send(`🔴 STOP / EXIT
-
-${t.symbol} SHORT
-Live: ${fmt(p)}
-Stop: ${fmt(t.stop)}`);
-      activeTrade = null;
-      return;
-    }
-  }
-}
-
 async function run() {
   console.log("RUN");
 
-  await update();
-
-  if (activeTrade && activeTrade.symbol) {
-    console.log("ACTIVE:", activeTrade.symbol, activeTrade.side);
-    return;
-  }
-
-  activeTrade = null;
-
   let best = null;
   let checked = 0;
+  let duplicates = 0;
 
   for (const s of symbols) {
     checked++;
 
     const sig = await scan(s);
     if (!sig) continue;
+
+    if (isDuplicate(sig)) {
+      duplicates++;
+      continue;
+    }
 
     console.log("CANDIDATE:", sig.symbol, sig.side, "RR:", sig.rr.toFixed(2), "SCORE:", sig.score);
 
@@ -388,7 +303,7 @@ async function run() {
     }
   }
 
-  console.log("CHECKED:", checked);
+  console.log("CHECKED:", checked, "DUPLICATES:", duplicates);
 
   if (!best) {
     console.log("NO SIGNAL");
@@ -406,15 +321,11 @@ TP1: ${fmt(best.tp1)}
 TP2: ${fmt(best.tp2)}
 Stop: ${fmt(best.stop)}
 
-Stop Logic: Hybrid Swing + ATR`);
+Stop Logic: Hybrid Swing + ATR
+Note: Sinyal gönderildi ama bot trade'i aktif saymıyor.`);
 
   if (sent) {
-    activeTrade = {
-      ...best,
-      tp1Hit: false,
-      createdAt: Date.now()
-    };
-
+    markSignal(best);
     console.log("SIGNAL SENT:", best.symbol, best.side);
   }
 }
@@ -437,7 +348,6 @@ Stop Logic: Hybrid Swing + ATR`);
       await run();
     } catch (e) {
       console.log("ERR:", e.message);
-      activeTrade = null;
     }
 
     console.log("SLEEPING:", LOOP_MS);
