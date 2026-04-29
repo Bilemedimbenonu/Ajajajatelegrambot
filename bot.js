@@ -1,201 +1,254 @@
 const TG_TOKEN = process.env.TG_BOT_TOKEN;
 const CHAT_ID = process.env.TG_CHAT_ID;
 
-const LOOP_MS = 60000;
-const COOLDOWN_MS = 5400000;
+const LOOP_MS = parseInt(process.env.LOOP_MS || "60000", 10);
+const COOLDOWN_MS = parseInt(process.env.COOLDOWN_MS || "5400000", 10);
 
-const MIN_SCORE = 8;
-const MIN_RR = 2.5;
-
-const COINS = [
-"BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT",
-"XRPUSDT","ADAUSDT","DOGEUSDT","AVAXUSDT","LINKUSDT","MATICUSDT","DOTUSDT","LTCUSDT",
-"APTUSDT","OPUSDT","ARBUSDT","INJUSDT","SUIUSDT","SEIUSDT","FTMUSDT","NEARUSDT","ATOMUSDT","FILUSDT"
-];
+const MIN_SCORE = 7.2;
+const MIN_RR = 2.2;
 
 const OKX = "https://www.okx.com";
 
+const COINS = [
+  "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT",
+  "XRPUSDT","ADAUSDT","DOGEUSDT","AVAXUSDT","LINKUSDT","DOTUSDT","LTCUSDT",
+  "APTUSDT","OPUSDT","ARBUSDT","INJUSDT","SUIUSDT","SEIUSDT","NEARUSDT","ATOMUSDT","FILUSDT"
+];
+
 const lastSignal = new Map();
 
-console.log("🔥 V18 RETEST MODE START");
+console.log("🔥 V18.2 PRO RETEST MODE START");
 
-// ================= HELPERS =================
-async function fetchJson(url){
-  try{
-    const r = await fetch(url);
-    if(!r.ok) return null;
+async function fetchJson(url) {
+  try {
+    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!r.ok) return null;
     return await r.json();
-  }catch{
+  } catch {
     return null;
   }
 }
 
-function toOkx(sym){
-  return sym.replace("USDT","-USDT-SWAP");
+function toOkx(sym) {
+  return sym.replace("USDT", "-USDT-SWAP");
 }
 
-async function klines(sym, tf="5m"){
+async function klines(sym, tf = "5m") {
   const j = await fetchJson(`${OKX}/api/v5/market/candles?instId=${toOkx(sym)}&bar=${tf}&limit=120`);
-  if(!j || j.code!=="0") return null;
+  if (!j || j.code !== "0" || !Array.isArray(j.data)) return null;
 
-  return j.data.reverse().map(x=>({
-    o:+x[1],h:+x[2],l:+x[3],c:+x[4],v:+x[5]
+  return j.data.slice().reverse().map(x => ({
+    o: +x[1],
+    h: +x[2],
+    l: +x[3],
+    c: +x[4],
+    v: +x[5]
   }));
 }
 
-// ================= INDICATORS =================
-function ema(arr,p){
-  const k=2/(p+1);
-  let e=arr[0];
-  return arr.map(v=>e=v*k+e*(1-k));
+function ema(arr, p) {
+  const k = 2 / (p + 1);
+  let e = arr[0];
+  return arr.map(v => e = v * k + e * (1 - k));
 }
 
-function avg(a){return a.reduce((x,y)=>x+y,0)/a.length;}
+function avg(a) {
+  if (!a.length) return 0;
+  return a.reduce((x, y) => x + y, 0) / a.length;
+}
 
-function atr(d){
-  let r=[];
-  for(let i=1;i<d.length;i++){
-    r.push(Math.max(
-      d[i].h-d[i].l,
-      Math.abs(d[i].h-d[i-1].c),
-      Math.abs(d[i].l-d[i-1].c)
+function atr(d) {
+  const tr = [];
+  for (let i = 1; i < d.length; i++) {
+    tr.push(Math.max(
+      d[i].h - d[i].l,
+      Math.abs(d[i].h - d[i - 1].c),
+      Math.abs(d[i].l - d[i - 1].c)
     ));
   }
-  return avg(r.slice(-14));
+  return avg(tr.slice(-14));
 }
 
-function rr(e,s,tp){
-  return Math.abs(tp-e)/Math.abs(e-s);
+function rr(entry, stop, tp) {
+  const risk = Math.abs(entry - stop);
+  if (risk <= 0) return 0;
+  return Math.abs(tp - entry) / risk;
 }
 
-// ================= SCORE =================
-function scoreCalc({R,volRatio,trend,momentum}){
-  let s=0;
-
-  if(R>=3) s+=3;
-  else if(R>=2.5) s+=2.5;
-
-  if(volRatio>=2) s+=2;
-  else if(volRatio>=1.5) s+=1.5;
-
-  if(trend) s+=2;
-  if(momentum) s+=1.5;
-
-  s+=1;
-
-  return Math.min(10,parseFloat(s.toFixed(1)));
+function fmt(n) {
+  if (!Number.isFinite(n)) return "-";
+  return Math.abs(n) >= 1 ? n.toFixed(4) : n.toFixed(6);
 }
 
-// ================= DUPLICATE =================
-function isDuplicate(sym,side){
-  const key=sym+side;
-  if(!lastSignal.has(key)) return false;
+function scoreCalc({ R, volRatio, trend, retest, momentum }) {
+  let s = 0;
 
-  return Date.now()-lastSignal.get(key)<COOLDOWN_MS;
+  if (R >= 3) s += 3;
+  else if (R >= 2.5) s += 2.5;
+  else if (R >= 2.2) s += 2;
+
+  if (volRatio >= 2) s += 2;
+  else if (volRatio >= 1.5) s += 1.5;
+  else if (volRatio >= 1.25) s += 1;
+
+  if (trend) s += 2;
+  if (retest) s += 1.5;
+  if (momentum) s += 1;
+
+  return Math.min(10, Number(s.toFixed(1)));
 }
 
-function mark(sym,side){
-  lastSignal.set(sym+side,Date.now());
+function cleanCandle(d) {
+  const x = d.at(-1);
+  const range = Math.max(x.h - x.l, 0.0000001);
+  const body = Math.abs(x.c - x.o);
+  const upper = x.h - Math.max(x.c, x.o);
+  const lower = Math.min(x.c, x.o) - x.l;
+
+  if (body / range < 0.20) return false;
+  if (upper / range > 0.65) return false;
+  if (lower / range > 0.65) return false;
+
+  return true;
 }
 
-// ================= SCAN =================
-async function scan(sym){
+function isDuplicate(sig) {
+  const key = `${sig.symbol}:${sig.side}`;
+  const last = lastSignal.get(key);
+  return last && Date.now() - last < COOLDOWN_MS;
+}
 
-  const d5=await klines(sym,"5m");
-  const d15=await klines(sym,"15m");
+function mark(sig) {
+  lastSignal.set(`${sig.symbol}:${sig.side}`, Date.now());
+}
 
-  if(!d5||!d15||d5.length<80) return null;
+async function send(msg) {
+  if (!TG_TOKEN || !CHAT_ID) {
+    console.log("TELEGRAM ENV MISSING");
+    return false;
+  }
 
-  const c=d5.map(x=>x.c);
-  const v=d5.map(x=>x.v);
-
-  const e20=ema(c,20);
-  const e50=ema(c,50);
-
-  const last=c.at(-1);
-  const prev=c.at(-2);
-
-  const volNow=v.at(-1);
-  const volAvg=avg(v.slice(-20));
-  const volRatio=volNow/volAvg;
-
-  const atrVal=atr(d5);
-
-  if(volRatio<1.4) return null;
-  if((atrVal/last)*100<0.2) return null;
-
-  const trendUp=e20.at(-1)>e50.at(-1);
-  const trendDn=e20.at(-1)<e50.at(-1);
-
-  // ================= RETEST LOGIC =================
-
-  const high=Math.max(...d5.slice(-10).map(x=>x.h));
-  const low=Math.min(...d5.slice(-10).map(x=>x.l));
-
-  // LONG RETEST
-  if(trendUp && prev>high && last<high && last>e20.at(-1)){
-
-    const entry=last;
-    const stop=Math.min(...d5.slice(-10).map(x=>x.l));
-
-    const tp2=entry+(entry-stop)*2.6;
-    const R=rr(entry,stop,tp2);
-
-    if(R<MIN_RR) return null;
-
-    const score=scoreCalc({
-      R,
-      volRatio,
-      trend:true,
-      momentum:true
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: CHAT_ID, text: msg })
     });
 
-    if(score<MIN_SCORE) return null;
+    const t = await r.text();
+    console.log("TELEGRAM:", t);
+    return r.ok;
+  } catch (e) {
+    console.log("TELEGRAM ERROR:", e.message);
+    return false;
+  }
+}
 
-    if(isDuplicate(sym,"LONG")) return null;
+async function scan(sym) {
+  const d5 = await klines(sym, "5m");
+  const d15 = await klines(sym, "15m");
+
+  if (!Array.isArray(d5) || !Array.isArray(d15)) return null;
+  if (d5.length < 80 || d15.length < 80) return null;
+  if (!cleanCandle(d5)) return null;
+
+  const c5 = d5.map(x => x.c);
+  const c15 = d15.map(x => x.c);
+  const v5 = d5.map(x => x.v);
+
+  const e20 = ema(c5, 20);
+  const e50 = ema(c5, 50);
+  const e20_15 = ema(c15, 20);
+  const e50_15 = ema(c15, 50);
+
+  const last = c5.at(-1);
+  const prev = c5.at(-2);
+
+  const atrVal = atr(d5);
+  if (!atrVal || (atrVal / last) * 100 < 0.14) return null;
+
+  const volNow = v5.at(-1);
+  const volAvg = avg(v5.slice(-20));
+  const volRatio = volNow / volAvg;
+
+  if (volRatio < 1.25) return null;
+
+  const trendUp = e20.at(-1) > e50.at(-1) && e20_15.at(-1) > e50_15.at(-1);
+  const trendDown = e20.at(-1) < e50.at(-1) && e20_15.at(-1) < e50_15.at(-1);
+
+  const high = Math.max(...d5.slice(-12, -2).map(x => x.h));
+  const low = Math.min(...d5.slice(-12, -2).map(x => x.l));
+
+  const longRetest = trendUp && prev > high && last <= high * 1.004 && last > e20.at(-1);
+  const shortRetest = trendDown && prev < low && last >= low * 0.996 && last < e20.at(-1);
+
+  const longMomentum = last > e20.at(-1);
+  const shortMomentum = last < e20.at(-1);
+
+  if (longRetest) {
+    const entry = last;
+    const swingStop = Math.min(...d5.slice(-10).map(x => x.l));
+    const atrStop = entry - atrVal * 1.3;
+    const stop = Math.min(swingStop, atrStop);
+
+    const tp1 = entry + (entry - stop) * 1.1;
+    const tp2 = entry + (entry - stop) * 2.4;
+    const R = rr(entry, stop, tp2);
+
+    if (R < MIN_RR) return null;
+
+    const score = scoreCalc({
+      R,
+      volRatio,
+      trend: true,
+      retest: true,
+      momentum: longMomentum
+    });
+
+    if (score < MIN_SCORE) return null;
 
     return {
-      symbol:sym,
-      side:"LONG",
+      symbol: sym,
+      side: "LONG",
       entry,
       stop,
-      tp1:entry+(entry-stop)*1.2,
+      tp1,
       tp2,
-      rr:R,
+      rr: R,
       score
     };
   }
 
-  // SHORT RETEST
-  if(trendDn && prev<low && last>low && last<e20.at(-1)){
+  if (shortRetest) {
+    const entry = last;
+    const swingStop = Math.max(...d5.slice(-10).map(x => x.h));
+    const atrStop = entry + atrVal * 1.3;
+    const stop = Math.max(swingStop, atrStop);
 
-    const entry=last;
-    const stop=Math.max(...d5.slice(-10).map(x=>x.h));
+    const tp1 = entry - (stop - entry) * 1.1;
+    const tp2 = entry - (stop - entry) * 2.4;
+    const R = rr(entry, stop, tp2);
 
-    const tp2=entry-(stop-entry)*2.6;
-    const R=rr(entry,stop,tp2);
+    if (R < MIN_RR) return null;
 
-    if(R<MIN_RR) return null;
-
-    const score=scoreCalc({
+    const score = scoreCalc({
       R,
       volRatio,
-      trend:true,
-      momentum:true
+      trend: true,
+      retest: true,
+      momentum: shortMomentum
     });
 
-    if(score<MIN_SCORE) return null;
-
-    if(isDuplicate(sym,"SHORT")) return null;
+    if (score < MIN_SCORE) return null;
 
     return {
-      symbol:sym,
-      side:"SHORT",
+      symbol: sym,
+      side: "SHORT",
       entry,
       stop,
-      tp1:entry-(stop-entry)*1.2,
+      tp1,
       tp2,
-      rr:R,
+      rr: R,
       score
     };
   }
@@ -203,55 +256,72 @@ async function scan(sym){
   return null;
 }
 
-// ================= TELEGRAM =================
-async function send(msg){
-  await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({chat_id:CHAT_ID,text:msg})
-  });
-}
+async function run() {
+  console.log("RUN");
 
-// ================= MAIN =================
-async function run(){
+  let best = null;
+  let checked = 0;
+  let dup = 0;
 
-  let best=null;
+  for (const sym of COINS) {
+    checked++;
 
-  for(const s of COINS){
+    const sig = await scan(sym);
+    if (!sig) continue;
 
-    const sig=await scan(s);
-    if(!sig) continue;
+    if (isDuplicate(sig)) {
+      dup++;
+      continue;
+    }
 
-    if(!best || sig.score>best.score) best=sig;
+    console.log("CANDIDATE:", sig.symbol, sig.side, "RR:", sig.rr.toFixed(2), "SCORE:", sig.score);
+
+    if (!best || sig.score > best.score || (sig.score === best.score && sig.rr > best.rr)) {
+      best = sig;
+    }
   }
 
-  if(!best){
+  console.log("CHECKED:", checked, "DUP:", dup);
+
+  if (!best) {
     console.log("NO SIGNAL");
     return;
   }
 
-  await send(`🚀 V18 RETEST SIGNAL
+  const sent = await send(`🚀 V18.2 PRO RETEST SIGNAL
 
 ${best.symbol} ${best.side}
 Score: ${best.score}/10
 RR: ${best.rr.toFixed(2)}
 
-Entry: ${best.entry}
-TP1: ${best.tp1}
-TP2: ${best.tp2}
-Stop: ${best.stop}
+Entry: ${fmt(best.entry)}
+TP1: ${fmt(best.tp1)}
+TP2: ${fmt(best.tp2)}
+Stop: ${fmt(best.stop)}
 
-Logic: Breakout → Retest`);
+Logic: Breakout → Retest → Confirm
+Not: 20x yerine küçük margin / düşük leverage önerilir.`);
 
-  mark(best.symbol,best.side);
+  if (sent) {
+    mark(best);
+    console.log("SIGNAL SENT:", best.symbol, best.side);
+  }
 }
 
-// ================= LOOP =================
-(async()=>{
-  while(true){
-    try{ await run(); }
-    catch(e){ console.log("ERR",e.message); }
+(async () => {
+  if (!TG_TOKEN || !CHAT_ID) {
+    console.log("ENV ERROR: TG_BOT_TOKEN / TG_CHAT_ID");
+    return;
+  }
 
-    await new Promise(r=>setTimeout(r,LOOP_MS));
+  while (true) {
+    try {
+      await run();
+    } catch (e) {
+      console.log("ERR:", e.message);
+    }
+
+    console.log("SLEEPING:", LOOP_MS);
+    await new Promise(r => setTimeout(r, LOOP_MS));
   }
 })();
