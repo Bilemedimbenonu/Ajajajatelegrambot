@@ -4,8 +4,7 @@ const CHAT_ID = process.env.TG_CHAT_ID;
 const LOOP_MS = 60000;
 const COOLDOWN_MS = 5400000;
 
-const MIN_SCORE = 7.8;
-const MIN_RR = 2.4;
+const MIN_RR = 2.2;
 
 const OKX = "https://www.okx.com";
 
@@ -13,16 +12,12 @@ const COINS = [
 "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT",
 "XRPUSDT","ADAUSDT","DOGEUSDT","AVAXUSDT","LINKUSDT","DOTUSDT","LTCUSDT",
 "ATOMUSDT","NEARUSDT","FILUSDT","APTUSDT","ARBUSDT","OPUSDT","INJUSDT",
-"SUIUSDT","SEIUSDT","FTMUSDT","MATICUSDT","ALGOUSDT","ICPUSDT",
-"ETCUSDT","AAVEUSDT","UNIUSDT","XLMUSDT","EOSUSDT","TRXUSDT",
-"SNXUSDT","RUNEUSDT","GRTUSDT","KAVAUSDT","FLOWUSDT",
-"AXSUSDT","CHZUSDT","CRVUSDT","DYDXUSDT","GMXUSDT",
-"LDOUSDT","STXUSDT","IMXUSDT","ENSUSDT","ZILUSDT"
+"SUIUSDT","SEIUSDT","MATICUSDT","ICPUSDT","AAVEUSDT","UNIUSDT","TRXUSDT"
 ];
 
 const lastSignal = new Map();
 
-console.log("🔥 V18.4 REACTION MODE START");
+console.log("🔥 V19 TREND SYSTEM START");
 
 // ===== FETCH =====
 async function fetchJson(url){
@@ -47,39 +42,73 @@ async function klines(sym, tf="5m"){
 }
 
 // ===== INDICATORS =====
-function ema(a,p){
-  const k=2/(p+1); let e=a[0];
-  return a.map(v=>e=v*k+e*(1-k));
+function sma(arr,p){
+  let res=[];
+  for(let i=0;i<arr.length;i++){
+    if(i<p) res.push(arr[i]);
+    else res.push(arr.slice(i-p,i).reduce((a,b)=>a+b,0)/p);
+  }
+  return res;
 }
-function avg(a){return a.reduce((x,y)=>x+y,0)/a.length;}
-function atr(d){
-  let r=[];
+
+function std(arr,p){
+  let res=[];
+  for(let i=0;i<arr.length;i++){
+    if(i<p) res.push(0);
+    else{
+      let slice=arr.slice(i-p,i);
+      let m=slice.reduce((a,b)=>a+b,0)/p;
+      let v=slice.reduce((a,b)=>a+(b-m)**2,0)/p;
+      res.push(Math.sqrt(v));
+    }
+  }
+  return res;
+}
+
+function bollinger(c){
+  const mid=sma(c,20);
+  const sd=std(c,20);
+  const upper=mid.map((m,i)=>m+sd[i]*2);
+  const lower=mid.map((m,i)=>m-sd[i]*2);
+  return {mid,upper,lower};
+}
+
+function vwap(d){
+  let cumVol=0, cumPV=0;
+  return d.map(x=>{
+    cumVol+=x.v;
+    cumPV+=x.c*x.v;
+    return cumPV/cumVol;
+  });
+}
+
+// ADX basit versiyon
+function adx(d){
+  let tr=[],dmPlus=[],dmMinus=[];
   for(let i=1;i<d.length;i++){
-    r.push(Math.max(
+    let up=d[i].h-d[i-1].h;
+    let down=d[i-1].l-d[i].l;
+
+    dmPlus.push(up>down && up>0?up:0);
+    dmMinus.push(down>up && down>0?down:0);
+
+    tr.push(Math.max(
       d[i].h-d[i].l,
       Math.abs(d[i].h-d[i-1].c),
       Math.abs(d[i].l-d[i-1].c)
     ));
   }
-  return avg(r.slice(-14));
+
+  const atr = tr.slice(-14).reduce((a,b)=>a+b,0)/14;
+  const pDI = dmPlus.slice(-14).reduce((a,b)=>a+b,0)/atr;
+  const mDI = dmMinus.slice(-14).reduce((a,b)=>a+b,0)/atr;
+
+  const dx = Math.abs(pDI-mDI)/(pDI+mDI)*100;
+  return dx;
 }
+
 function rr(e,s,tp){
   return Math.abs(tp-e)/Math.abs(e-s);
-}
-
-// ===== CLEAN CANDLE =====
-function strongBullish(d){
-  const x=d.at(-1);
-  const body=Math.abs(x.c-x.o);
-  const range=x.h-x.l;
-  return x.c>x.o && body/range>0.4;
-}
-
-function strongBearish(d){
-  const x=d.at(-1);
-  const body=Math.abs(x.c-x.o);
-  const range=x.h-x.l;
-  return x.c<x.o && body/range>0.4;
 }
 
 // ===== DUP =====
@@ -104,78 +133,58 @@ async function send(msg){
 // ===== SCAN =====
 async function scan(sym){
 
-  const d5=await klines(sym,"5m");
-  if(!d5||d5.length<80) return null;
+  const d=await klines(sym,"5m");
+  if(!d||d.length<80) return null;
 
-  const c=d5.map(x=>x.c);
-  const v=d5.map(x=>x.v);
+  const c=d.map(x=>x.c);
 
-  const e20=ema(c,20);
-  const e50=ema(c,50);
+  const bb=bollinger(c);
+  const vw=vwap(d);
 
   const last=c.at(-1);
   const prev=c.at(-2);
-  const prev2=c.at(-3);
 
-  const atrVal=atr(d5);
+  const adxVal=adx(d);
 
-  const volNow=v.at(-1);
-  const volAvg=avg(v.slice(-20));
-  const volRatio=volNow/volAvg;
-
-  if(volRatio<1.3) return null;
-  if((atrVal/last)*100<0.18) return null;
-
-  const trendUp=e20.at(-1)>e50.at(-1);
-  const trendDn=e20.at(-1)<e50.at(-1);
-
-  const high=Math.max(...d5.slice(-12,-2).map(x=>x.h));
-  const low=Math.min(...d5.slice(-12,-2).map(x=>x.l));
+  // 🚫 TREND YOKSA TRADE YOK
+  if(adxVal<20) return null;
 
   // ===== LONG =====
   if(
-    trendUp &&
-    prev>high &&                     // breakout
-    last<high &&                    // retest
-    last>e20.at(-1) &&
-    strongBullish(d5) &&            // 🔥 REACTION
-    prev2<prev                      // momentum
+    last>bb.upper.at(-1) &&   // BB breakout
+    last>vw.at(-1) &&         // VWAP üstü
+    last>prev                 // momentum
   ){
 
     const entry=last;
-    const swing=Math.min(...d5.slice(-10).map(x=>x.l));
-    const stop=Math.min(swing, entry-atrVal*1.5);
+    const stop=Math.min(...d.slice(-10).map(x=>x.l));
 
-    const tp2=entry+(entry-stop)*2.6;
+    const tp2=entry+(entry-stop)*2.3;
     const R=rr(entry,stop,tp2);
 
     if(R<MIN_RR) return null;
     if(isDuplicate(sym,"LONG")) return null;
 
-    return {sym,side:"LONG",entry,stop,tp1:entry+(entry-stop)*1.2,tp2,rr:R};
+    return {sym,side:"LONG",entry,stop,tp1:entry+(entry-stop)*1.1,tp2,rr:R};
   }
 
   // ===== SHORT =====
   if(
-    trendDn &&
-    prev<low &&
-    last>low &&
-    last<e20.at(-1) &&
-    strongBearish(d5) &&           // 🔥 REACTION
-    prev2>prev
+    last<bb.lower.at(-1) &&
+    last<vw.at(-1) &&
+    last<prev
   ){
 
     const entry=last;
-    const swing=Math.max(...d5.slice(-10).map(x=>x.h));
-    const stop=Math.max(swing, entry+atrVal*1.5);
+    const stop=Math.max(...d.slice(-10).map(x=>x.h));
 
-    const tp2=entry-(stop-entry)*2.6;
+    const tp2=entry-(stop-entry)*2.3;
     const R=rr(entry,stop,tp2);
 
     if(R<MIN_RR) return null;
     if(isDuplicate(sym,"SHORT")) return null;
 
-    return {sym,side:"SHORT",entry,stop,tp1:entry-(stop-entry)*1.2,tp2,rr:R};
+    return {sym,side:"SHORT",entry,stop,tp1:entry-(stop-entry)*1.1,tp2,rr:R};
   }
 
   return null;
@@ -199,7 +208,7 @@ async function run(){
     return;
   }
 
-  await send(`🚀 V18.4 REACTION SIGNAL
+  await send(`🚀 V19 TREND SIGNAL
 
 ${best.sym} ${best.side}
 RR: ${best.rr.toFixed(2)}
@@ -209,7 +218,7 @@ TP1: ${best.tp1}
 TP2: ${best.tp2}
 Stop: ${best.stop}
 
-Logic: Retest + Reaction Candle`);
+Logic: ADX Trend + BB Breakout + VWAP`);
 
   mark(best.sym,best.side);
 }
