@@ -1,10 +1,9 @@
-{
+ {
   "name": "okx-scalping-scanner",
   "version": "2.0.0",
-  "description": "OKX Futures Scalping Scanner — 20x Leverage",
-  "main": "index.js",
+  "main": "bot.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node bot.js"
   },
   "dependencies": {
     "axios": "^1.7.2",
@@ -15,3 +14,4 @@
     "node": ">=18.0.0"
   }
 }
+
