@@ -5,10 +5,7 @@ const LOOP_MS = 60000;
 const COOLDOWN_MS = 7200000;
 
 const MIN_SCORE = 7.4;
-const MIN_RR = 1.6;
-
-const TURTLE_LEN = 20;
-const MAX_HOLD_MIN = 90;
+const MIN_RR = 1.5;
 
 const OKX = "https://www.okx.com";
 
@@ -22,7 +19,7 @@ const COINS = [
 
 const lastSignal = new Map();
 
-console.log("🔥 V23 TURTLE SCALP HYBRID START");
+console.log("🔥 V26 MB FAILURE SYSTEM START");
 
 async function fetchJson(url) {
   try {
@@ -56,14 +53,26 @@ function avg(a) {
   return a.reduce((x, y) => x + y, 0) / a.length;
 }
 
-function ema(arr, p) {
-  const k = 2 / (p + 1);
-  let e = arr[0];
-  return arr.map(v => e = v * k + e * (1 - k));
+function std(a) {
+  const m = avg(a);
+  return Math.sqrt(avg(a.map(x => (x - m) ** 2)));
+}
+
+function bb(closes, p = 20, mult = 2) {
+  const s = closes.slice(-p);
+  const mid = avg(s);
+  const dev = std(s);
+
+  return {
+    upper: mid + dev * mult,
+    mid,
+    lower: mid - dev * mult
+  };
 }
 
 function atr(d, p = 14) {
   const tr = [];
+
   for (let i = 1; i < d.length; i++) {
     tr.push(Math.max(
       d[i].h - d[i].l,
@@ -71,7 +80,38 @@ function atr(d, p = 14) {
       Math.abs(d[i].l - d[i - 1].c)
     ));
   }
+
   return avg(tr.slice(-p));
+}
+
+function adx(d, p = 14) {
+  if (d.length < p + 2) return 0;
+
+  const tr = [];
+  const plus = [];
+  const minus = [];
+
+  for (let i = 1; i < d.length; i++) {
+    const up = d[i].h - d[i - 1].h;
+    const down = d[i - 1].l - d[i].l;
+
+    plus.push(up > down && up > 0 ? up : 0);
+    minus.push(down > up && down > 0 ? down : 0);
+
+    tr.push(Math.max(
+      d[i].h - d[i].l,
+      Math.abs(d[i].h - d[i - 1].c),
+      Math.abs(d[i].l - d[i - 1].c)
+    ));
+  }
+
+  const trAvg = avg(tr.slice(-p));
+  if (!trAvg) return 0;
+
+  const pdi = 100 * avg(plus.slice(-p)) / trAvg;
+  const mdi = 100 * avg(minus.slice(-p)) / trAvg;
+
+  return Math.abs(pdi - mdi) / Math.max(pdi + mdi, 0.000001) * 100;
 }
 
 function rr(entry, stop, tp) {
@@ -85,42 +125,46 @@ function fmt(n) {
   return Number(n).toFixed(4);
 }
 
-function candleQuality(d, side) {
+function reactionCandle(d, side) {
   const x = d.at(-1);
   const range = Math.max(x.h - x.l, 0.0000001);
   const body = Math.abs(x.c - x.o);
   const upper = x.h - Math.max(x.c, x.o);
   const lower = Math.min(x.c, x.o) - x.l;
 
-  if (body / range < 0.42) return false;
+  if (body / range < 0.35) return false;
 
   if (side === "LONG") {
     if (x.c <= x.o) return false;
-    if (upper / range > 0.38) return false;
+    if (lower / range < 0.20) return false;
+    if (upper / range > 0.45) return false;
   }
 
   if (side === "SHORT") {
     if (x.c >= x.o) return false;
-    if (lower / range > 0.38) return false;
+    if (upper / range < 0.20) return false;
+    if (lower / range > 0.45) return false;
   }
 
   return true;
 }
 
-function scoreCalc({ R, volRatio, turtleBreak, trendOk, candleOk, atrOk }) {
+function scoreCalc({ R, volRatio, adxVal, failure, reaction, mbDistance }) {
   let s = 0;
 
-  if (turtleBreak) s += 2.4;
-  if (trendOk) s += 1.8;
-  if (candleOk) s += 1.5;
-  if (atrOk) s += 1.0;
+  if (failure) s += 2.5;
+  if (reaction) s += 2.0;
 
-  if (volRatio >= 2.0) s += 2.0;
-  else if (volRatio >= 1.5) s += 1.5;
+  if (R >= 2.0) s += 1.5;
+  else if (R >= 1.5) s += 1.0;
+
+  if (volRatio >= 1.7) s += 1.5;
   else if (volRatio >= 1.25) s += 1.0;
 
-  if (R >= 2.0) s += 1.3;
-  else if (R >= 1.6) s += 0.9;
+  if (adxVal >= 14 && adxVal <= 28) s += 1.5;
+  else if (adxVal < 14) s += 0.5;
+
+  if (mbDistance <= 0.35) s += 1.0;
 
   return Math.min(10, Number(s.toFixed(1)));
 }
@@ -154,53 +198,51 @@ async function send(msg) {
 
 async function scan(sym) {
   const d5 = await klines(sym, "5m");
-  const d15 = await klines(sym, "15m");
+  if (!Array.isArray(d5) || d5.length < 80) return null;
 
-  if (!Array.isArray(d5) || !Array.isArray(d15)) return null;
-  if (d5.length < 80 || d15.length < 80) return null;
+  const c = d5.map(x => x.c);
+  const v = d5.map(x => x.v);
 
-  const c5 = d5.map(x => x.c);
-  const c15 = d15.map(x => x.c);
-  const v5 = d5.map(x => x.v);
+  const last = c.at(-1);
+  const prev = c.at(-2);
+  const prev2 = c.at(-3);
 
-  const last = c5.at(-1);
-  const prev = c5.at(-2);
+  const band = bb(c, 20, 2);
+  const a = atr(d5, 14);
+  const adxVal = adx(d5, 14);
 
-  const e20 = ema(c5, 20);
-  const e50 = ema(c5, 50);
-  const e20_15 = ema(c15, 20);
-  const e50_15 = ema(c15, 50);
+  if (!a || (a / last) * 100 < 0.08) return null;
 
-  const atrVal = atr(d5, 14);
-  if (!atrVal) return null;
+  // Mean reversion sistemi: çok güçlü trendde işlem açma.
+  if (adxVal > 30) return null;
 
-  const atrPct = (atrVal / last) * 100;
-  if (atrPct < 0.14) return null;
-
-  const volNow = v5.at(-1);
-  const volAvg = avg(v5.slice(-20, -1));
+  const volNow = v.at(-1);
+  const volAvg = avg(v.slice(-20, -1));
   const volRatio = volNow / volAvg;
 
-  if (volRatio < 1.25) return null;
+  if (volRatio < 1.10) return null;
 
-  const turtleHigh = Math.max(...d5.slice(-(TURTLE_LEN + 1), -1).map(x => x.h));
-  const turtleLow = Math.min(...d5.slice(-(TURTLE_LEN + 1), -1).map(x => x.l));
+  const mb = band.mid;
+  const mbDistance = Math.abs(last - mb) / last * 100;
 
-  const longBreak = last > turtleHigh && prev <= turtleHigh;
-  const shortBreak = last < turtleLow && prev >= turtleLow;
+  // LONG FAILURE:
+  // Satıcılar MB altına iter, ama aşağıda kalamaz; son mum MB üstüne reclaim eder.
+  const recentBelowMB = d5.slice(-6, -1).some(x => x.c < mb);
+  const failedDown =
+    recentBelowMB &&
+    prev < mb &&
+    last > mb &&
+    last > prev &&
+    last > prev2 &&
+    reactionCandle(d5, "LONG");
 
-  const trendLong = e20.at(-1) > e50.at(-1) && e20_15.at(-1) >= e50_15.at(-1);
-  const trendShort = e20.at(-1) < e50.at(-1) && e20_15.at(-1) <= e50_15.at(-1);
-
-  if (longBreak && trendLong && candleQuality(d5, "LONG")) {
+  if (failedDown) {
     const entry = last;
+    const stop = Math.min(...d5.slice(-8).map(x => x.l)) - a * 0.25;
 
-    const structureStop = Math.min(...d5.slice(-10).map(x => x.l));
-    const atrStop = entry - atrVal * 1.2;
-    const stop = Math.min(structureStop, atrStop);
-
+    // Hedef: MB reclaim sonrası kısa devam. Çok uzak hedef kovalamıyoruz.
     const tp1 = entry + (entry - stop) * 0.8;
-    const tp2 = entry + (entry - stop) * 1.7;
+    const tp2 = entry + (entry - stop) * 1.6;
     const R = rr(entry, stop, tp2);
 
     if (R < MIN_RR) return null;
@@ -209,10 +251,10 @@ async function scan(sym) {
     const score = scoreCalc({
       R,
       volRatio,
-      turtleBreak: true,
-      trendOk: true,
-      candleOk: true,
-      atrOk: true
+      adxVal,
+      failure: true,
+      reaction: true,
+      mbDistance
     });
 
     if (score < MIN_SCORE) return null;
@@ -226,21 +268,29 @@ async function scan(sym) {
       tp2,
       rr: R,
       score,
+      adx: adxVal,
       volRatio,
-      atrPct,
-      turtleLevel: turtleHigh
+      mb
     };
   }
 
-  if (shortBreak && trendShort && candleQuality(d5, "SHORT")) {
-    const entry = last;
+  // SHORT FAILURE:
+  // Alıcılar MB üstüne iter, ama yukarıda kalamaz; son mum MB altına reject eder.
+  const recentAboveMB = d5.slice(-6, -1).some(x => x.c > mb);
+  const failedUp =
+    recentAboveMB &&
+    prev > mb &&
+    last < mb &&
+    last < prev &&
+    last < prev2 &&
+    reactionCandle(d5, "SHORT");
 
-    const structureStop = Math.max(...d5.slice(-10).map(x => x.h));
-    const atrStop = entry + atrVal * 1.2;
-    const stop = Math.max(structureStop, atrStop);
+  if (failedUp) {
+    const entry = last;
+    const stop = Math.max(...d5.slice(-8).map(x => x.h)) + a * 0.25;
 
     const tp1 = entry - (stop - entry) * 0.8;
-    const tp2 = entry - (stop - entry) * 1.7;
+    const tp2 = entry - (stop - entry) * 1.6;
     const R = rr(entry, stop, tp2);
 
     if (R < MIN_RR) return null;
@@ -249,10 +299,10 @@ async function scan(sym) {
     const score = scoreCalc({
       R,
       volRatio,
-      turtleBreak: true,
-      trendOk: true,
-      candleOk: true,
-      atrOk: true
+      adxVal,
+      failure: true,
+      reaction: true,
+      mbDistance
     });
 
     if (score < MIN_SCORE) return null;
@@ -266,9 +316,9 @@ async function scan(sym) {
       tp2,
       rr: R,
       score,
+      adx: adxVal,
       volRatio,
-      atrPct,
-      turtleLevel: turtleLow
+      mb
     };
   }
 
@@ -297,7 +347,9 @@ async function run() {
       "RR:",
       sig.rr.toFixed(2),
       "SCORE:",
-      sig.score
+      sig.score,
+      "ADX:",
+      sig.adx.toFixed(1)
     );
 
     if (!best || sig.score > best.score || (sig.score === best.score && sig.rr > best.rr)) {
@@ -312,23 +364,22 @@ async function run() {
     return;
   }
 
-  const sent = await send(`🐢⚡ V23 TURTLE SCALP SIGNAL
+  const sent = await send(`🎯 V26 MB FAILURE SIGNAL
 
 ${best.sym} ${best.side}
 Güven: ${best.score}/10
 RR: ${best.rr.toFixed(2)}
+ADX: ${best.adx.toFixed(1)}
 Volume: ${best.volRatio.toFixed(2)}x
-ATR: ${best.atrPct.toFixed(2)}%
 
-Turtle Level: ${fmt(best.turtleLevel)}
+MB: ${fmt(best.mb)}
 Entry: ${fmt(best.entry)}
 TP1: ${fmt(best.tp1)}
 TP2: ${fmt(best.tp2)}
 Stop: ${fmt(best.stop)}
 
-Max Hold: ${MAX_HOLD_MIN} dk
-Logic: Turtle Breakout + Scalp Filter
-Not: OKX verisiyle hesaplandı; Binance girişi öncesi fiyat farkını kontrol et.`);
+Logic: MB kırılım denedi → tutunamadı → ters yönde reaction
+Not: Mean reversion scalp. Güçlü trendde işlem açmaz.`);
 
   if (sent) {
     mark(best.sym, best.side);
