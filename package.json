@@ -1,4 +1,4 @@
- {
+{
   "name": "okx-scalping-scanner",
   "version": "2.0.0",
   "main": "bot.js",
@@ -14,4 +14,3 @@
     "node": ">=18.0.0"
   }
 }
-
