@@ -1,171 +1,134 @@
-// ============================================================
-// OKX Futures Scalping Scanner v3 — Maximum Winrate Edition
-// Railway + GitHub | Node.js 18+
-// npm install axios technicalindicators dotenv
-//
-// Sinyal motoru (10 koşul):
-//   1.  EMA 9/21/50 dizilimi     — 5m + 15m çift teyit
-//   2.  VWAP pozisyonu           — 5m
-//   3.  Supertrend yönü          — 5m
-//   4.  Stoch RSI crossover      — 1m
-//   5.  RSI(7) bant              — 1m
-//   6.  MACD histogram yönü      — 3m
-//   7.  CVD delta trendi         — 1m
-//   8.  Hacim spike x2           — 1m
-//   9.  Order book imbalance     — anlık
-//  10.  Funding rate filtresi    — squeeze önleme
-//
-// Hard filtreler (skor dışı — biri başarısız → sinyal iptal):
-//   - Piyasa rejimi: range / volatile → sinyal yok
-//   - RSI diverjans filtresi
-//   - BTC korelasyon filtresi
-//   - Session filtresi (08-22 UTC)
-//   - ATR minimum eşiği
-//   - 15m trend teyidi (üst TF bias)
-//
-// MIN_SCORE = 8/10 → az ama kaliteli sinyal
-// ============================================================
-
 require(“dotenv”).config();
 const axios = require(“axios”);
 const ti    = require(“technicalindicators”);
-
-// ─── CONFIG ──────────────────────────────────────────────────
 
 const TG_BOT_TOKEN      = process.env.TG_BOT_TOKEN || “”;
 const TG_CHAT_ID        = process.env.TG_CHAT_ID   || “”;
 const OKX_BASE          = “https://www.okx.com”;
 
-const SCAN_INTERVAL_MS  = 120_000;      // 2 dakika
-const MIN_SCORE         = 8;            // 10 üzerinden — yüksek kalite
-const VOL_SPIKE_MULT    = 2.0;          // daha sıkı hacim filtresi
-const MIN_24H_VOL       = 20_000_000;   // min $20M — likit coinler
-const MAX_COINS         = 100;          // top 100
-const FUNDING_LONG_MAX  = 0.0006;       // long max funding
-const FUNDING_SHORT_MIN = 0.0002;       // short min funding
-const COOLDOWN_MS       = 600_000;      // 10 dk — az ama kaliteli sinyal
+const SCAN_INTERVAL_MS  = 120000;
+const MIN_SCORE         = 8;
+const VOL_SPIKE_MULT    = 2.0;
+const MIN_24H_VOL       = 20000000;
+const MAX_COINS         = 100;
+const FUNDING_LONG_MAX  = 0.0006;
+const FUNDING_SHORT_MIN = 0.0002;
+const COOLDOWN_MS       = 600000;
 const CONCURRENT        = 10;
-
 const ATR_SL_MULT       = 1.0;
 const ATR_TP1_MULT      = 1.5;
 const ATR_TP2_MULT      = 3.5;
-
 const SESSION_FILTER    = true;
-const PRIME_HOURS_UTC   = new Set([8,9,10,11,12,13,14,15,16,17,18,19,20,21]);
-const OB_IMBALANCE_MIN  = 0.62;
+const PRIME_HOURS       = new Set([8,9,10,11,12,13,14,15,16,17,18,19,20,21]);
+const OB_MIN            = 0.62;
 const BTC_FILTER        = true;
-const ATR_MIN_RATIO     = 0.85; // ATR ortalamanın en az %85’i olmalı
-
-// ─── STATE ───────────────────────────────────────────────────
+const ATR_MIN_RATIO     = 0.85;
 
 const lastSignal = {};
 let   btcTrend   = “neutral”;
 let   watchlist  = [];
 
-// ─── OKX REST ────────────────────────────────────────────────
-
-async function okxGet(path, params = {}) {
+async function okxGet(path, params) {
 try {
 const res = await axios.get(OKX_BASE + path, {
-params,
+params: params || {},
 timeout: 12000,
-headers: { “User-Agent”: “Mozilla/5.0” },
+headers: { “User-Agent”: “Mozilla/5.0” }
 });
-if (res.data?.code === “0”) return res.data;
+if (res.data && res.data.code === “0”) return res.data;
 return null;
-} catch { return null; }
+} catch(e) { return null; }
 }
 
 async function fetchAllInstruments() {
 const inst = await okxGet(”/api/v5/public/instruments”, { instType: “SWAP” });
 if (!inst) { console.error(”[ERR] Enstruman listesi alinamadi”); return []; }
 
-const active = new Set(
-inst.data
-.filter(d => d.settleCcy === “USDT” && d.state === “live”)
-.map(d => d.instId)
-);
+var active = {};
+inst.data.forEach(function(d) {
+if (d.settleCcy === “USDT” && d.state === “live”) active[d.instId] = true;
+});
 
 const tickers = await okxGet(”/api/v5/market/tickers”, { instType: “SWAP” });
-if (!tickers) return […active].slice(0, MAX_COINS);
+if (!tickers) return Object.keys(active).slice(0, MAX_COINS);
 
-const volMap = {};
-for (const t of tickers.data) {
-if (active.has(t.instId)) volMap[t.instId] = parseFloat(t.volCcy24h || 0);
-}
+var volMap = {};
+tickers.data.forEach(function(t) {
+if (active[t.instId]) volMap[t.instId] = parseFloat(t.volCcy24h || 0);
+});
 
-const filtered = Object.entries(volMap)
-.filter(([, v]) => v >= MIN_24H_VOL)
-.sort(([, a], [, b]) => b - a)
-.slice(0, MAX_COINS)
-.map(([id]) => id);
+var filtered = Object.keys(volMap)
+.filter(function(id) { return volMap[id] >= MIN_24H_VOL; })
+.sort(function(a, b) { return volMap[b] - volMap[a]; })
+.slice(0, MAX_COINS);
 
-console.log(`[INFO] ${active.size} coin -> filtre: ${filtered.length} taranacak`);
+console.log(”[INFO] “ + Object.keys(active).length + “ coin -> filtre: “ + filtered.length + “ taranacak”);
 return filtered;
 }
 
-async function fetchCandles(instId, bar, limit = 150) {
-const data = await okxGet(”/api/v5/market/candles”, { instId, bar, limit });
-if (!data?.data?.length) return null;
-return data.data.reverse().map(r => ({
+async function fetchCandles(instId, bar, limit) {
+const data = await okxGet(”/api/v5/market/candles”, { instId: instId, bar: bar, limit: limit || 120 });
+if (!data || !data.data || !data.data.length) return null;
+return data.data.reverse().map(function(r) {
+return {
 ts:    parseInt(r[0]),
 open:  parseFloat(r[1]),
 high:  parseFloat(r[2]),
 low:   parseFloat(r[3]),
 close: parseFloat(r[4]),
-vol:   parseFloat(r[5]),
-}));
+vol:   parseFloat(r[5])
+};
+});
 }
 
 async function fetchFunding(instId) {
-const data = await okxGet(”/api/v5/public/funding-rate”, { instId });
-if (!data?.data?.[0]) return null;
+const data = await okxGet(”/api/v5/public/funding-rate”, { instId: instId });
+if (!data || !data.data || !data.data[0]) return null;
 return parseFloat(data.data[0].fundingRate);
 }
 
 async function fetchOrderbook(instId) {
-const data = await okxGet(”/api/v5/market/books”, { instId, sz: “20” });
-if (!data?.data?.[0]) return null;
+const data = await okxGet(”/api/v5/market/books”, { instId: instId, sz: “20” });
+if (!data || !data.data || !data.data[0]) return null;
 return data.data[0];
 }
 
 async function fetchTicker(instId) {
-const data = await okxGet(”/api/v5/market/ticker”, { instId });
-if (!data?.data?.[0]) return null;
+const data = await okxGet(”/api/v5/market/ticker”, { instId: instId });
+if (!data || !data.data || !data.data[0]) return null;
 return data.data[0];
 }
 
-// ─── INDIKATÖRLER ────────────────────────────────────────────
-
 function pad(arr, len) {
-const diff = len - arr.length;
-return diff > 0 ? […Array(diff).fill(null), …arr] : arr;
+var diff = len - arr.length;
+if (diff <= 0) return arr;
+var prefix = [];
+for (var i = 0; i < diff; i++) prefix.push(null);
+return prefix.concat(arr);
 }
 
 function calcEMA(closes, period) {
-return pad(ti.EMA.calculate({ period, values: closes }), closes.length);
+return pad(ti.EMA.calculate({ period: period, values: closes }), closes.length);
 }
 
 function calcRSI(closes, period) {
-return pad(ti.RSI.calculate({ period, values: closes }), closes.length);
+return pad(ti.RSI.calculate({ period: period, values: closes }), closes.length);
 }
 
 function calcStochRSI(closes) {
 return pad(
-ti.StochasticRSI.calculate({
-values: closes, rsiPeriod: 14, stochasticPeriod: 14, kPeriod: 3, dPeriod: 3,
-}),
+ti.StochasticRSI.calculate({ values: closes, rsiPeriod: 14, stochasticPeriod: 14, kPeriod: 3, dPeriod: 3 }),
 closes.length
 );
 }
 
-function calcATR(candles, period = 14) {
+function calcATR(candles, period) {
 return pad(
 ti.ATR.calculate({
-high:  candles.map(c => c.high),
-low:   candles.map(c => c.low),
-close: candles.map(c => c.close),
-period,
+high:  candles.map(function(c) { return c.high; }),
+low:   candles.map(function(c) { return c.low; }),
+close: candles.map(function(c) { return c.close; }),
+period: period || 14
 }),
 candles.length
 );
@@ -173,69 +136,60 @@ candles.length
 
 function calcMACD(closes) {
 return pad(
-ti.MACD.calculate({
-values: closes,
-fastPeriod: 5, slowPeriod: 13, signalPeriod: 1,
-SimpleMAOscillator: false, SimpleMASignal: false,
-}),
+ti.MACD.calculate({ values: closes, fastPeriod: 5, slowPeriod: 13, signalPeriod: 1, SimpleMAOscillator: false, SimpleMASignal: false }),
 closes.length
 );
 }
 
-function calcBBWidth(closes, period = 20) {
-const bb = ti.BollingerBands.calculate({ period, values: closes, stdDev: 2 });
-return pad(bb.map(b => (b.upper - b.lower) / b.middle), closes.length);
+function calcBBWidth(closes) {
+var bb = ti.BollingerBands.calculate({ period: 20, values: closes, stdDev: 2 });
+return pad(bb.map(function(b) { return (b.upper - b.lower) / b.middle; }), closes.length);
 }
 
-// VWAP — kümülatif (typical price × vol) / kümülatif vol
 function calcVWAP(candles) {
-let cumPV = 0, cumVol = 0;
-return candles.map(c => {
-const tp = (c.high + c.low + c.close) / 3;
+var cumPV = 0, cumVol = 0;
+return candles.map(function(c) {
+var tp = (c.high + c.low + c.close) / 3;
 cumPV  += tp * c.vol;
 cumVol += c.vol;
 return cumVol > 0 ? cumPV / cumVol : c.close;
 });
 }
 
-// CVD — Cumulative Volume Delta
-// close >= open → alış (+vol), close < open → satış (-vol)
 function calcCVD(candles) {
-let cum = 0;
-return candles.map(c => {
+var cum = 0;
+return candles.map(function(c) {
 cum += c.close >= c.open ? c.vol : -c.vol;
 return cum;
 });
 }
 
-// Supertrend — ATR bazlı trend çizgisi
-function calcSupertrend(candles, period = 10, mult = 3.0) {
-const atr    = calcATR(candles, period);
-const n      = candles.length;
-const upper  = new Array(n).fill(null);
-const lower  = new Array(n).fill(null);
-const st     = new Array(n).fill(null);  // supertrend değeri
-const dir    = new Array(n).fill(1);     // 1=up(long), -1=down(short)
+function calcSupertrend(candles, period, mult) {
+period = period || 10;
+mult   = mult   || 3.0;
+var atr  = calcATR(candles, period);
+var n    = candles.length;
+var upper = new Array(n).fill(null);
+var lower = new Array(n).fill(null);
+var dir   = new Array(n).fill(1);
+var st    = new Array(n).fill(null);
 
-for (let i = period; i < n; i++) {
-const hl2  = (candles[i].high + candles[i].low) / 2;
-const atrV = atr[i] || 0;
-upper[i]   = hl2 + mult * atrV;
-lower[i]   = hl2 - mult * atrV;
+for (var i = period; i < n; i++) {
+var hl2  = (candles[i].high + candles[i].low) / 2;
+var atrV = atr[i] || 0;
+upper[i] = hl2 + mult * atrV;
+lower[i] = hl2 - mult * atrV;
 
 ```
-// Band sıkıştırma
 if (i > period) {
-  upper[i] = upper[i] < upper[i-1] || candles[i-1].close > upper[i-1]
-    ? upper[i] : upper[i-1];
-  lower[i] = lower[i] > lower[i-1] || candles[i-1].close < lower[i-1]
-    ? lower[i] : lower[i-1];
+  if (upper[i] > upper[i-1] || candles[i-1].close > upper[i-1]) upper[i] = upper[i];
+  else upper[i] = upper[i-1];
+  if (lower[i] < lower[i-1] || candles[i-1].close < lower[i-1]) lower[i] = lower[i];
+  else lower[i] = lower[i-1];
 }
 
-// Yön tespiti
 if (i === period) {
-  dir[i] = 1;
-  st[i]  = lower[i];
+  dir[i] = 1; st[i] = lower[i];
 } else if (st[i-1] === upper[i-1]) {
   dir[i] = candles[i].close > upper[i] ? 1 : -1;
   st[i]  = dir[i] === 1 ? lower[i] : upper[i];
@@ -246,269 +200,158 @@ if (i === period) {
 ```
 
 }
-return dir; // 1 = yukarı trend, -1 = aşağı trend
+return dir;
 }
 
-// Ortalama hesabı (null filtreli)
-function avg(arr, last = 20) {
-const vals = arr.filter(v => v !== null).slice(-last);
+function avg(arr, last) {
+var vals = arr.filter(function(v) { return v !== null; }).slice(-(last || 20));
 if (!vals.length) return 0;
-return vals.reduce((a, b) => a + b, 0) / vals.length;
+return vals.reduce(function(a, b) { return a + b; }, 0) / vals.length;
 }
-
-// ─── TÜM İNDİKATÖRLERİ HESAPLA ──────────────────────────────
 
 function computeAll(candles) {
-const closes = candles.map(c => c.close);
+var closes = candles.map(function(c) { return c.close; });
 return {
-ema9:      calcEMA(closes, 9),
-ema21:     calcEMA(closes, 21),
-ema50:     calcEMA(closes, 50),
-rsi7:      calcRSI(closes, 7),
-rsi14:     calcRSI(closes, 14),
-stochRsi:  calcStochRSI(closes),
-atr:       calcATR(candles, 14),
-macd:      calcMACD(closes),
-bbWidth:   calcBBWidth(closes, 20),
-vwap:      calcVWAP(candles),
-cvd:       calcCVD(candles),
-supertrend:calcSupertrend(candles, 10, 3),
-vols:      candles.map(c => c.vol),
+ema9:       calcEMA(closes, 9),
+ema21:      calcEMA(closes, 21),
+ema50:      calcEMA(closes, 50),
+rsi7:       calcRSI(closes, 7),
+rsi14:      calcRSI(closes, 14),
+stochRsi:   calcStochRSI(closes),
+atr:        calcATR(candles, 14),
+macd:       calcMACD(closes),
+bbWidth:    calcBBWidth(closes),
+vwap:       calcVWAP(candles),
+cvd:        calcCVD(candles),
+supertrend: calcSupertrend(candles, 10, 3),
+vols:       candles.map(function(c) { return c.vol; })
 };
 }
 
-// ─── HARD FİLTRELER ──────────────────────────────────────────
-
-// Piyasa rejimi: range veya volatile → giriş yok
 function marketRegime(ind, n) {
-const atrVal  = ind.atr[n];
-const atrMA   = avg(ind.atr, 20);
-const bbW     = ind.bbWidth[n];
-const bbWMA   = avg(ind.bbWidth, 20);
+var atrVal = ind.atr[n];
+var atrMA  = avg(ind.atr, 20);
+var bbW    = ind.bbWidth[n];
+var bbWMA  = avg(ind.bbWidth, 20);
 if (!atrVal || !bbW) return “unknown”;
 if (atrVal > atrMA * 2.5) return “volatile”;
 if (bbW < bbWMA * 0.70)   return “range”;
 return “trend”;
 }
 
-// RSI diverjans — True = diverjans var → giriş iptal
 function detectDivergence(candles, rsi14, direction, n) {
 try {
 if (n < 6) return false;
-const c0 = candles[n].close,   c4 = candles[n-4].close;
-const r0 = rsi14[n],           r4 = rsi14[n-4];
+var c0 = candles[n].close,   c4 = candles[n-4].close;
+var r0 = rsi14[n],           r4 = rsi14[n-4];
 if (r0 == null || r4 == null) return false;
-if (direction === “long”)  return c0 > c4 && r0 < r4; // bearish div
-if (direction === “short”) return c0 < c4 && r0 > r4; // bullish div
-} catch { return false; }
+if (direction === “long”)  return c0 > c4 && r0 < r4;
+if (direction === “short”) return c0 < c4 && r0 > r4;
+} catch(e) { return false; }
 return false;
 }
 
-// Order book imbalance
 function obImbalance(ob, direction) {
-if (!ob) return true; // veri yoksa geç
+if (!ob) return true;
 try {
-const bidVol = ob.bids.slice(0,10).reduce((s, b) => s + parseFloat(b[1]), 0);
-const askVol = ob.asks.slice(0,10).reduce((s, a) => s + parseFloat(a[1]), 0);
-const total  = bidVol + askVol;
+var bidVol = ob.bids.slice(0,10).reduce(function(s,b) { return s + parseFloat(b[1]); }, 0);
+var askVol = ob.asks.slice(0,10).reduce(function(s,a) { return s + parseFloat(a[1]); }, 0);
+var total  = bidVol + askVol;
 if (!total) return true;
-const ratio = bidVol / total;
-return direction === “long”
-? ratio >= OB_IMBALANCE_MIN
-: ratio <= (1 - OB_IMBALANCE_MIN);
-} catch { return true; }
+var ratio = bidVol / total;
+return direction === “long” ? ratio >= OB_MIN : ratio <= (1 - OB_MIN);
+} catch(e) { return true; }
 }
 
-// Session filtresi
 function sessionOk() {
 if (!SESSION_FILTER) return true;
-return PRIME_HOURS_UTC.has(new Date().getUTCHours());
+return PRIME_HOURS.has(new Date().getUTCHours());
 }
 
-// BTC trend tespiti
 function getBtcTrend(candles) {
-const ind = computeAll(candles);
-const n   = candles.length - 1;
+var ind = computeAll(candles);
+var n   = candles.length - 1;
 if (ind.ema9[n] > ind.ema21[n] && ind.ema21[n] > ind.ema50[n]) return “up”;
 if (ind.ema9[n] < ind.ema21[n] && ind.ema21[n] < ind.ema50[n]) return “down”;
 return “neutral”;
 }
 
-// 15m üst TF teyidi
 function htfBias(candles15m, direction) {
-const ind = computeAll(candles15m);
-const n   = candles15m.length - 1;
-if (direction === “long”)
-return ind.ema9[n] > ind.ema21[n] && ind.supertrend[n] === 1;
-if (direction === “short”)
-return ind.ema9[n] < ind.ema21[n] && ind.supertrend[n] === -1;
+var ind = computeAll(candles15m);
+var n   = candles15m.length - 1;
+if (direction === “long”)  return ind.ema9[n] > ind.ema21[n] && ind.supertrend[n] === 1;
+if (direction === “short”) return ind.ema9[n] < ind.ema21[n] && ind.supertrend[n] === -1;
 return false;
 }
 
-// ─── SKOR MOTORU (10 koşul) ──────────────────────────────────
-
-function scoreSignal(c15m, c5m, c1m, funding, direction, ob) {
-let score = 0;
-const hits = [];
-let atr = 0;
+function scoreSignal(c5m, c1m, funding, direction, ob) {
+var score = 0;
+var hits  = [];
+var atr   = 0;
 
 try {
-const i5  = computeAll(c5m);
-const i1  = computeAll(c1m);
-const n5  = c5m.length - 1;
-const n1  = c1m.length - 1;
-const n1p = n1 - 1;
+var i5  = computeAll(c5m);
+var i1  = computeAll(c1m);
+var n5  = c5m.length - 1;
+var n1  = c1m.length - 1;
+var n1p = n1 - 1;
 
 ```
 atr = i1.atr[n1] || 0;
-const volAvg = avg(i1.vols, 20);
-const atrAvg = avg(i1.atr, 20);
+var volAvg = avg(i1.vols, 20);
+var atrAvg = avg(i1.atr, 20);
+var cvd    = i1.cvd;
+var cvdUp  = cvd[n1] > cvd[n1 - 5];
 
-const srK  = i1.stochRsi[n1]?.k;
-const srD  = i1.stochRsi[n1]?.d;
-const srKp = i1.stochRsi[n1p]?.k;
-const srDp = i1.stochRsi[n1p]?.d;
+var srK  = i1.stochRsi[n1]  ? i1.stochRsi[n1].k  : null;
+var srD  = i1.stochRsi[n1]  ? i1.stochRsi[n1].d  : null;
+var srKp = i1.stochRsi[n1p] ? i1.stochRsi[n1p].k : null;
+var srDp = i1.stochRsi[n1p] ? i1.stochRsi[n1p].d : null;
 
-const macd1  = i1.macd[n1];
-const close5 = c5m[n5].close;
-const close1 = c1m[n1].close;
-const vol1   = c1m[n1].vol;
-
-// CVD: son 5 barda trend
-const cvd = i1.cvd;
-const cvdUp = cvd[n1] > cvd[n1 - 5];
+var macd1  = i1.macd[n1];
+var close5 = c5m[n5].close;
+var vol1   = c1m[n1].vol;
+var rsi7   = i1.rsi7[n1];
 
 if (direction === "long") {
-
-  // 1. EMA dizilimi (5m)
-  if (i5.ema9[n5] > i5.ema21[n5] && i5.ema21[n5] > i5.ema50[n5]) {
-    score++; hits.push("EMA✓");
-  }
-
-  // 2. VWAP üzeri (5m)
-  if (close5 > i5.vwap[n5]) {
-    score++; hits.push("VWAP✓");
-  }
-
-  // 3. Supertrend yukarı (5m)
-  if (i5.supertrend[n5] === 1) {
-    score++; hits.push("ST✓");
-  }
-
-  // 4. Stoch RSI crossover yukarı (1m)
-  if (srK != null && srD != null &&
-      srK > srD && srKp <= srDp && srK > 20) {
-    score++; hits.push("StRSI✓");
-  }
-
-  // 5. RSI(7) momentum bandı (1m)
-  const rsi7 = i1.rsi7[n1];
-  if (rsi7 != null && rsi7 > 25 && rsi7 < 60) {
-    score++; hits.push("RSI✓");
-  }
-
-  // 6. MACD histogram pozitif (1m)
-  if (macd1?.histogram != null && macd1.histogram > 0) {
-    score++; hits.push("MACD✓");
-  }
-
-  // 7. CVD pozitif trend (1m)
-  if (cvdUp) {
-    score++; hits.push("CVD✓");
-  }
-
-  // 8. Hacim spike (1m)
-  if (vol1 > volAvg * VOL_SPIKE_MULT) {
-    score++; hits.push("VOL✓");
-  }
-
-  // 9. Order book alıcı baskısı
-  if (obImbalance(ob, "long")) {
-    score++; hits.push("OB✓");
-  }
-
-  // 10. Funding uygun
-  if (funding !== null && funding < FUNDING_LONG_MAX) {
-    score++; hits.push("FUND✓");
-  }
-
-} else { // SHORT
-
-  // 1. EMA dizilimi aşağı (5m)
-  if (i5.ema9[n5] < i5.ema21[n5] && i5.ema21[n5] < i5.ema50[n5]) {
-    score++; hits.push("EMA✓");
-  }
-
-  // 2. VWAP altı (5m)
-  if (close5 < i5.vwap[n5]) {
-    score++; hits.push("VWAP✓");
-  }
-
-  // 3. Supertrend aşağı (5m)
-  if (i5.supertrend[n5] === -1) {
-    score++; hits.push("ST✓");
-  }
-
-  // 4. Stoch RSI crossover aşağı (1m)
-  if (srK != null && srD != null &&
-      srK < srD && srKp >= srDp && srK < 80) {
-    score++; hits.push("StRSI✓");
-  }
-
-  // 5. RSI(7) overbought bölgesi (1m)
-  const rsi7 = i1.rsi7[n1];
-  if (rsi7 != null && rsi7 > 40 && rsi7 < 75) {
-    score++; hits.push("RSI✓");
-  }
-
-  // 6. MACD histogram negatif (1m)
-  if (macd1?.histogram != null && macd1.histogram < 0) {
-    score++; hits.push("MACD✓");
-  }
-
-  // 7. CVD negatif trend (1m)
-  if (!cvdUp) {
-    score++; hits.push("CVD✓");
-  }
-
-  // 8. Hacim spike (1m)
-  if (vol1 > volAvg * VOL_SPIKE_MULT) {
-    score++; hits.push("VOL✓");
-  }
-
-  // 9. Order book satıcı baskısı
-  if (obImbalance(ob, "short")) {
-    score++; hits.push("OB✓");
-  }
-
-  // 10. Funding squeeze uygun
-  if (funding !== null && funding > FUNDING_SHORT_MIN) {
-    score++; hits.push("FUND✓");
-  }
+  if (i5.ema9[n5] > i5.ema21[n5] && i5.ema21[n5] > i5.ema50[n5]) { score++; hits.push("EMA"); }
+  if (close5 > i5.vwap[n5])                                         { score++; hits.push("VWAP"); }
+  if (i5.supertrend[n5] === 1)                                       { score++; hits.push("ST"); }
+  if (srK != null && srD != null && srK > srD && srKp <= srDp && srK > 20) { score++; hits.push("StRSI"); }
+  if (rsi7 != null && rsi7 > 25 && rsi7 < 60)                       { score++; hits.push("RSI"); }
+  if (macd1 && macd1.histogram != null && macd1.histogram > 0)       { score++; hits.push("MACD"); }
+  if (cvdUp)                                                          { score++; hits.push("CVD"); }
+  if (vol1 > volAvg * VOL_SPIKE_MULT)                                { score++; hits.push("VOL"); }
+  if (obImbalance(ob, "long"))                                        { score++; hits.push("OB"); }
+  if (funding !== null && funding < FUNDING_LONG_MAX)                 { score++; hits.push("FUND"); }
+} else {
+  if (i5.ema9[n5] < i5.ema21[n5] && i5.ema21[n5] < i5.ema50[n5]) { score++; hits.push("EMA"); }
+  if (close5 < i5.vwap[n5])                                         { score++; hits.push("VWAP"); }
+  if (i5.supertrend[n5] === -1)                                      { score++; hits.push("ST"); }
+  if (srK != null && srD != null && srK < srD && srKp >= srDp && srK < 80) { score++; hits.push("StRSI"); }
+  if (rsi7 != null && rsi7 > 40 && rsi7 < 75)                       { score++; hits.push("RSI"); }
+  if (macd1 && macd1.histogram != null && macd1.histogram < 0)       { score++; hits.push("MACD"); }
+  if (!cvdUp)                                                         { score++; hits.push("CVD"); }
+  if (vol1 > volAvg * VOL_SPIKE_MULT)                                { score++; hits.push("VOL"); }
+  if (obImbalance(ob, "short"))                                       { score++; hits.push("OB"); }
+  if (funding !== null && funding > FUNDING_SHORT_MIN)                { score++; hits.push("FUND"); }
 }
 ```
 
-} catch (e) {
-console.debug(”[SCORE ERR]”, e.message);
-}
+} catch(e) { console.debug(”[SCORE ERR]”, e.message); }
 
-return { score, hits, atr };
+return { score: score, hits: hits, atr: atr };
 }
-
-// ─── TELEGRAM ────────────────────────────────────────────────
 
 async function sendTelegram(text) {
-if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
-console.warn(”[WARN] TG_BOT_TOKEN veya TG_CHAT_ID eksik!”);
-return;
-}
+if (!TG_BOT_TOKEN || !TG_CHAT_ID) { console.warn(”[WARN] Token eksik”); return; }
 try {
 await axios.post(
-`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`,
-{ chat_id: TG_CHAT_ID, text, parse_mode: “HTML”, disable_web_page_preview: true },
+“https://api.telegram.org/bot” + TG_BOT_TOKEN + “/sendMessage”,
+{ chat_id: TG_CHAT_ID, text: text, parse_mode: “HTML”, disable_web_page_preview: true },
 { timeout: 8000 }
 );
-} catch (e) { console.error(”[TG ERR]”, e.message); }
+} catch(e) { console.error(”[TG ERR]”, e.message); }
 }
 
 function fmtPrice(p) {
@@ -521,201 +364,174 @@ return p.toFixed(1);
 }
 
 function buildMessage(instId, direction, price, score, hits, funding, atr) {
-const symbol = instId.replace(”-USDT-SWAP”, “/USDT”);
-const emoji  = direction === “long” ? “🟢” : “🔴”;
-const dirTr  = direction === “long” ? “LONG  ▲” : “SHORT ▼”;
+var symbol = instId.replace(”-USDT-SWAP”, “/USDT”);
+var emoji  = direction === “long” ? “🟢” : “🔴”;
+var dirTr  = direction === “long” ? “LONG  ▲” : “SHORT ▼”;
 
-const sl  = direction === “long” ? price - atr * ATR_SL_MULT  : price + atr * ATR_SL_MULT;
-const tp1 = direction === “long” ? price + atr * ATR_TP1_MULT : price - atr * ATR_TP1_MULT;
-const tp2 = direction === “long” ? price + atr * ATR_TP2_MULT : price - atr * ATR_TP2_MULT;
+var sl  = direction === “long” ? price - atr * ATR_SL_MULT  : price + atr * ATR_SL_MULT;
+var tp1 = direction === “long” ? price + atr * ATR_TP1_MULT : price - atr * ATR_TP1_MULT;
+var tp2 = direction === “long” ? price + atr * ATR_TP2_MULT : price - atr * ATR_TP2_MULT;
 
-const slPct  = (Math.abs(price - sl)  / price * 100).toFixed(2);
-const tp1Pct = (Math.abs(tp1 - price) / price * 100).toFixed(2);
-const tp2Pct = (Math.abs(tp2 - price) / price * 100).toFixed(2);
-const rr     = (parseFloat(tp2Pct) / parseFloat(slPct)).toFixed(1);
+var slPct  = (Math.abs(price - sl)  / price * 100).toFixed(2);
+var tp1Pct = (Math.abs(tp1 - price) / price * 100).toFixed(2);
+var tp2Pct = (Math.abs(tp2 - price) / price * 100).toFixed(2);
+var rr     = (parseFloat(tp2Pct) / parseFloat(slPct)).toFixed(1);
+var profPct= (parseFloat(tp2Pct) * 20).toFixed(0);
+var lossPct= (parseFloat(slPct)  * 20).toFixed(0);
 
-const lev     = 20;
-const profPct = (parseFloat(tp2Pct) * lev).toFixed(0);
-const lossPct = (parseFloat(slPct)  * lev).toFixed(0);
+var fundStr = funding !== null ? (funding * 100).toFixed(4) + “%” : “-”;
+var now     = new Date().toUTCString().slice(5, 25) + “ UTC”;
+var bar     = “█”.repeat(score) + “░”.repeat(10 - score);
+var tier    = score === 10 ? “🔥 MUKEMMEL” : score === 9 ? “⭐ GUCLU” : “✅ YETERLI”;
 
-const fundStr  = funding !== null ? `${(funding * 100).toFixed(4)}%` : “—”;
-const now      = new Date().toUTCString().slice(5, 25) + “ UTC”;
-const bar      = “█”.repeat(score) + “░”.repeat(10 - score);
-const tier     = score === 10 ? “🔥 MÜKEMMEL” : score === 9 ? “⭐ GÜÇLÜ” : “✅ YETERLI”;
-
-return (
-`${emoji} <b>${dirTr} — ${symbol}</b>\n` +
-`━━━━━━━━━━━━━━━━━━━━━━\n` +
-`💰 Giriş:  <b>${fmtPrice(price)}</b>\n` +
-`🎯 TP1:    <b>${fmtPrice(tp1)}</b>  (+${tp1Pct}%)\n` +
-`🎯 TP2:    <b>${fmtPrice(tp2)}</b>  (+${tp2Pct}%)\n` +
-`🛑 SL:     <b>${fmtPrice(sl)}</b>  (-${slPct}%)\n` +
-`━━━━━━━━━━━━━━━━━━━━━━\n` +
-`📊 Skor: ${bar} <b>${score}/10</b>  ${tier}\n` +
-`✅ <code>${hits.join(" ")}</code>\n` +
-`━━━━━━━━━━━━━━━━━━━━━━\n` +
-`⚡ 20x → Kar: <b>+%${profPct}</b> | Zarar: <b>-%${lossPct}</b>\n` +
-`⚖️ R:R: 1:${rr}  |  💸 Funding: ${fundStr}\n` +
-`━━━━━━━━━━━━━━━━━━━━━━\n` +
-`💡 <i>TP1'de %50 kapat → SL'i giriş fiyatına çek → TP2 bekle</i>\n` +
-`🕒 ${now}\n` +
-`<i>⚠ Ticaret tavsiyesi değildir.</i>`
-);
+return emoji + “ <b>” + dirTr + “ — “ + symbol + “</b>\n” +
+“━━━━━━━━━━━━━━━━━━━━━━\n” +
+“💰 Giris:  <b>” + fmtPrice(price) + “</b>\n” +
+“🎯 TP1:    <b>” + fmtPrice(tp1) + “</b>  (+” + tp1Pct + “%)\n” +
+“🎯 TP2:    <b>” + fmtPrice(tp2) + “</b>  (+” + tp2Pct + “%)\n” +
+“🛑 SL:     <b>” + fmtPrice(sl) + “</b>  (-” + slPct + “%)\n” +
+“━━━━━━━━━━━━━━━━━━━━━━\n” +
+“📊 Skor: “ + bar + “ <b>” + score + “/10</b>  “ + tier + “\n” +
+“✅ <code>” + hits.join(” “) + “</code>\n” +
+“━━━━━━━━━━━━━━━━━━━━━━\n” +
+“⚡ 20x → Kar: <b>+%” + profPct + “</b> | Zarar: <b>-%” + lossPct + “</b>\n” +
+“⚖️ R:R: 1:” + rr + “  |  💸 Funding: “ + fundStr + “\n” +
+“━━━━━━━━━━━━━━━━━━━━━━\n” +
+“💡 <i>TP1’de %50 kapat → SL’i giris fiyatina cek → TP2 bekle</i>\n” +
+“🕒 “ + now + “\n” +
+“<i>⚠ Ticaret tavsiyesi degildir.</i>”;
 }
-
-// ─── TEK COİN TARAMA ─────────────────────────────────────────
 
 async function scanCoin(instId) {
 try {
 if (!sessionOk()) return;
 
 ```
-const ticker = await fetchTicker(instId);
+var ticker = await fetchTicker(instId);
 if (!ticker) return;
-const price = parseFloat(ticker.last || 0);
+var price = parseFloat(ticker.last || 0);
 if (price <= 0) return;
 
-// 1m + 5m + 15m + funding + OB paralel
-const [c1m, c5m, c15m, funding, ob] = await Promise.all([
+var results = await Promise.all([
   fetchCandles(instId, "1m",  120),
   fetchCandles(instId, "5m",  150),
   fetchCandles(instId, "15m", 100),
   fetchFunding(instId),
-  fetchOrderbook(instId),
+  fetchOrderbook(instId)
 ]);
+
+var c1m     = results[0];
+var c5m     = results[1];
+var c15m    = results[2];
+var funding = results[3];
+var ob      = results[4];
 
 if (!c1m || !c5m || !c15m) return;
 if (c1m.length < 60 || c5m.length < 60 || c15m.length < 30) return;
 
-// ATR minimum eşiği — düz piyasa filtresi
-const atr1   = calcATR(c1m, 14);
-const atrVal = atr1[atr1.length - 1];
-const atrMA  = avg(atr1, 20);
-if (!atrVal || atrVal < atrMA * ATR_MIN_RATIO) {
-  console.debug(`${instId} ATR düşük → atlandı`);
-  return;
-}
+var atr1   = calcATR(c1m, 14);
+var atrVal = atr1[atr1.length - 1];
+var atrMA  = avg(atr1, 20);
+if (!atrVal || atrVal < atrMA * ATR_MIN_RATIO) return;
 
-const i1m = computeAll(c1m);
-const n1  = c1m.length - 1;
+var i1m = computeAll(c1m);
+var n1  = c1m.length - 1;
 
-for (const direction of ["long", "short"]) {
-  const key = `${instId}_${direction}`;
+var directions = ["long", "short"];
+for (var d = 0; d < directions.length; d++) {
+  var direction = directions[d];
+  var key = instId + "_" + direction;
   if (Date.now() - (lastSignal[key] || 0) < COOLDOWN_MS) continue;
 
-  // ── Hard filtreler ────────────────────────────────────────
+  var regime = marketRegime(i1m, n1);
+  if (regime === "range" || regime === "volatile") continue;
 
-  // 1. Piyasa rejimi
-  const regime = marketRegime(i1m, n1);
-  if (regime === "range" || regime === "volatile") {
-    console.debug(`${instId} ${direction} → ${regime} piyasa`);
-    continue;
-  }
+  if (detectDivergence(c1m, i1m.rsi14, direction, n1)) continue;
 
-  // 2. RSI diverjans
-  if (detectDivergence(c1m, i1m.rsi14, direction, n1)) {
-    console.debug(`${instId} ${direction} → diverjans`);
-    continue;
-  }
-
-  // 3. BTC korelasyon filtresi
-  if (BTC_FILTER && !instId.includes("BTC-USDT-SWAP")) {
+  if (BTC_FILTER && instId.indexOf("BTC-USDT-SWAP") === -1) {
     if (direction === "long"  && btcTrend === "down") continue;
     if (direction === "short" && btcTrend === "up")   continue;
   }
 
-  // 4. 15m üst TF teyidi
-  if (!htfBias(c15m, direction)) {
-    console.debug(`${instId} ${direction} → 15m bias yok`);
-    continue;
-  }
+  if (!htfBias(c15m, direction)) continue;
 
-  // ── Skor ─────────────────────────────────────────────────
+  var result = scoreSignal(c5m, c1m, funding, direction, ob);
 
-  const { score, hits, atr } = scoreSignal(c15m, c5m, c1m, funding, direction, ob);
-
-  if (score >= MIN_SCORE) {
-    console.log(`🚀 SİNYAL → ${instId} ${direction.toUpperCase()} ${score}/10`, hits.join(" "));
-    const msg = buildMessage(instId, direction, price, score, hits, funding, atr);
+  if (result.score >= MIN_SCORE) {
+    console.log("🚀 SINYAL → " + instId + " " + direction.toUpperCase() + " " + result.score + "/10 " + result.hits.join(" "));
+    var msg = buildMessage(instId, direction, price, result.score, result.hits, funding, result.atr);
     await sendTelegram(msg);
     lastSignal[key] = Date.now();
-  } else {
-    console.debug(`${instId} ${direction} ${score}/10 — yetersiz`);
   }
 }
 ```
 
-} catch (e) {
-console.error(`[ERR] ${instId}:`, e.message);
+} catch(e) {
+console.error(”[ERR] “ + instId + “: “ + e.message);
 }
 }
-
-// ─── ANA DÖNGÜ ───────────────────────────────────────────────
 
 async function runBatch(list) {
-for (let i = 0; i < list.length; i += CONCURRENT) {
-await Promise.all(list.slice(i, i + CONCURRENT).map(id => scanCoin(id)));
+for (var i = 0; i < list.length; i += CONCURRENT) {
+var batch = list.slice(i, i + CONCURRENT);
+await Promise.all(batch.map(function(id) { return scanCoin(id); }));
 }
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
 
 async function main() {
-console.log(”=”.repeat(58));
-console.log(”  OKX Scalping Scanner v3 — Maximum Winrate Edition”);
-console.log(`  Min skor: ${MIN_SCORE}/10 | Cooldown: ${COOLDOWN_MS/60000}dk`);
-console.log(`  Tarama: ${SCAN_INTERVAL_MS/1000}s | Max coin: ${MAX_COINS}`);
-console.log(`  TF: 1m + 5m + 15m (triple TF)`);
-console.log(`  Filtreler: Regime + Diverjans + BTC + HTF Bias + ATR`);
-console.log(”=”.repeat(58));
+console.log(”==================================================”);
+console.log(”  OKX Scalping Scanner v3 - Maximum Winrate”);
+console.log(”  Min skor: “ + MIN_SCORE + “/10 | Cooldown: “ + (COOLDOWN_MS/60000) + “dk”);
+console.log(”  TF: 1m + 5m + 15m | Max coin: “ + MAX_COINS);
+console.log(”==================================================”);
 
 await sendTelegram(
-`🤖 <b>OKX Scanner v3 aktif</b>\n` +
-`Skor: ${MIN_SCORE}/10 | Cooldown: ${COOLDOWN_MS/60000}dk\n` +
-`TF: 1m + 5m + 15m | Max coin: ${MAX_COINS}\n` +
-`Filtreler: Regime ✓ Diverjans ✓ BTC ✓ HTF ✓ ATR ✓`
+“🤖 <b>OKX Scanner v3 aktif</b>\n” +
+“Skor: “ + MIN_SCORE + “/10 | Cooldown: “ + (COOLDOWN_MS/60000) + “dk\n” +
+“TF: 1m + 5m + 15m | Max coin: “ + MAX_COINS + “\n” +
+“Filtreler: Regime CVD MACD Supertrend HTF ATR”
 );
 
-let cycle = 0;
+var cycle = 0;
 
 while (true) {
 cycle++;
-const t0 = Date.now();
-console.log(`\n─── Tur #${cycle} | ${new Date().toUTCString()} ───`);
+var t0 = Date.now();
+console.log(”\n— Tur #” + cycle + “ | “ + new Date().toUTCString() + “ —”);
 
 ```
-// Her 5 turda coin listesini yenile (~10 dakika)
 if (cycle === 1 || cycle % 5 === 0) {
   watchlist = await fetchAllInstruments();
   if (!watchlist.length) {
     console.error("[ERR] Coin listesi bos, 30s bekle...");
-    await sleep(30_000);
+    await sleep(30000);
     continue;
   }
 }
 
-// BTC trend güncelle
 try {
-  const btcC = await fetchCandles("BTC-USDT-SWAP", "5m", 60);
+  var btcC = await fetchCandles("BTC-USDT-SWAP", "5m", 60);
   if (btcC) {
     btcTrend = getBtcTrend(btcC);
-    console.log(`BTC trend: ${btcTrend.toUpperCase()}`);
+    console.log("BTC trend: " + btcTrend.toUpperCase());
   }
-} catch {}
+} catch(e) {}
 
 await runBatch(watchlist);
 
-const elapsed = Date.now() - t0;
-console.log(`─── Tur #${cycle} bitti (${(elapsed/1000).toFixed(1)}s) | ${watchlist.length} coin ───`);
+var elapsed = Date.now() - t0;
+console.log("--- Tur #" + cycle + " bitti (" + (elapsed/1000).toFixed(1) + "s) | " + watchlist.length + " coin ---");
 
-const wait = Math.max(0, SCAN_INTERVAL_MS - elapsed);
+var wait = Math.max(0, SCAN_INTERVAL_MS - elapsed);
 if (wait) await sleep(wait);
 ```
 
 }
 }
 
-main().catch(e => {
+main().catch(function(e) {
 console.error(”[FATAL]”, e);
 process.exit(1);
 });
