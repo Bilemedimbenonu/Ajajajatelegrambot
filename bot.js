@@ -6,14 +6,14 @@ const TG_BOT_TOKEN      = process.env.TG_BOT_TOKEN || “”;
 const TG_CHAT_ID        = process.env.TG_CHAT_ID   || “”;
 const BINANCE_BASE      = “https://fapi.binance.com”;
 
-const SCAN_INTERVAL_MS  = 120000;   // 2 dakika
-const MIN_SCORE         = 8;        // 11 üzerinden
+const SCAN_INTERVAL_MS  = 120000;
+const MIN_SCORE         = 8;
 const VOL_SPIKE_MULT    = 2.0;
-const MIN_24H_VOL       = 50000000; // $50M minimum
+const MIN_24H_VOL       = 50000000;
 const MAX_COINS         = 80;
 const FUNDING_LONG_MAX  = 0.0008;
 const FUNDING_SHORT_MIN = 0.0002;
-const COOLDOWN_MS       = 900000;   // 15 dk — az ama kaliteli
+const COOLDOWN_MS       = 900000;
 const CONCURRENT        = 8;
 const OB_MIN            = 0.62;
 const BTC_FILTER        = true;
@@ -22,8 +22,6 @@ const ATR_MIN_RATIO     = 0.8;
 const lastSignal = {};
 let   btcTrend   = “neutral”;
 let   watchlist  = [];
-
-// ─── BINANCE REST ─────────────────────────────────────────────
 
 async function binanceGet(path, params) {
 try {
@@ -39,43 +37,26 @@ return res.data;
 async function fetchAllInstruments() {
 const data = await binanceGet(”/fapi/v1/exchangeInfo”);
 if (!data || !data.symbols) { console.error(”[ERR] Binance enstruman listesi alinamadi”); return []; }
-
 var usdt = data.symbols.filter(function(s) {
 return s.quoteAsset === “USDT” && s.status === “TRADING” && s.contractType === “PERPETUAL”;
 }).map(function(s) { return s.symbol; });
-
-// 24s hacim filtresi
 const tickers = await binanceGet(”/fapi/v1/ticker/24hr”);
 if (!tickers) return usdt.slice(0, MAX_COINS);
-
 var volMap = {};
-tickers.forEach(function(t) {
-volMap[t.symbol] = parseFloat(t.quoteVolume || 0);
-});
-
+tickers.forEach(function(t) { volMap[t.symbol] = parseFloat(t.quoteVolume || 0); });
 var filtered = usdt
 .filter(function(s) { return volMap[s] >= MIN_24H_VOL; })
 .sort(function(a, b) { return (volMap[b] || 0) - (volMap[a] || 0); })
 .slice(0, MAX_COINS);
-
 console.log(”[INFO] “ + usdt.length + “ coin -> filtre: “ + filtered.length + “ taranacak”);
 return filtered;
 }
 
 async function fetchCandles(symbol, interval, limit) {
-const data = await binanceGet(”/fapi/v1/klines”, {
-symbol: symbol, interval: interval, limit: limit || 150
-});
+const data = await binanceGet(”/fapi/v1/klines”, { symbol: symbol, interval: interval, limit: limit || 150 });
 if (!data || !data.length) return null;
 return data.map(function(r) {
-return {
-ts:    r[0],
-open:  parseFloat(r[1]),
-high:  parseFloat(r[2]),
-low:   parseFloat(r[3]),
-close: parseFloat(r[4]),
-vol:   parseFloat(r[5])
-};
+return { ts: r[0], open: parseFloat(r[1]), high: parseFloat(r[2]), low: parseFloat(r[3]), close: parseFloat(r[4]), vol: parseFloat(r[5]) };
 });
 }
 
@@ -87,17 +68,13 @@ return parseFloat(data.lastFundingRate || 0);
 
 async function fetchOrderbook(symbol) {
 const data = await binanceGet(”/fapi/v1/depth”, { symbol: symbol, limit: 20 });
-if (!data) return null;
-return data;
+return data || null;
 }
 
 async function fetchTicker(symbol) {
 const data = await binanceGet(”/fapi/v1/ticker/price”, { symbol: symbol });
-if (!data) return null;
-return data;
+return data || null;
 }
-
-// ─── INDIKATÖRLER ─────────────────────────────────────────────
 
 function pad(arr, len) {
 var diff = len - arr.length;
@@ -112,8 +89,8 @@ function calcRSI(closes, period) { return pad(ti.RSI.calculate({ period: period,
 function calcStochRSI(closes) { return pad(ti.StochasticRSI.calculate({ values: closes, rsiPeriod: 14, stochasticPeriod: 14, kPeriod: 3, dPeriod: 3 }), closes.length); }
 function calcATR(candles, period) {
 return pad(ti.ATR.calculate({
-high:  candles.map(function(c) { return c.high; }),
-low:   candles.map(function(c) { return c.low; }),
+high: candles.map(function(c) { return c.high; }),
+low: candles.map(function(c) { return c.low; }),
 close: candles.map(function(c) { return c.close; }),
 period: period || 14
 }), candles.length);
@@ -168,29 +145,22 @@ return vals.reduce(function(a, b) { return a + b; }, 0) / vals.length;
 function computeAll(candles) {
 var closes = candles.map(function(c) { return c.close; });
 return {
-ema9:       calcEMA(closes, 9),
-ema21:      calcEMA(closes, 21),
-ema50:      calcEMA(closes, 50),
-rsi7:       calcRSI(closes, 7),
-rsi14:      calcRSI(closes, 14),
-stochRsi:   calcStochRSI(closes),
-atr:        calcATR(candles, 14),
-macd:       calcMACD(closes),
-bbWidth:    calcBBWidth(closes),
-vwap:       calcVWAP(candles),
-cvd:        calcCVD(candles),
+ema9: calcEMA(closes, 9), ema21: calcEMA(closes, 21), ema50: calcEMA(closes, 50),
+rsi7: calcRSI(closes, 7), rsi14: calcRSI(closes, 14),
+stochRsi: calcStochRSI(closes), atr: calcATR(candles, 14),
+macd: calcMACD(closes), bbWidth: calcBBWidth(closes),
+vwap: calcVWAP(candles), cvd: calcCVD(candles),
 supertrend: calcSupertrend(candles, 10, 3),
-vols:       candles.map(function(c) { return c.vol; })
+vols: candles.map(function(c) { return c.vol; })
 };
 }
 
-// ─── GRAFİK ANALİZİ ───────────────────────────────────────────
+// ─── GRAFIK ANALIZ ───────────────────────────────────────────
 
-// Swing high/low tespiti
 function findSwings(candles, lookback) {
 lookback = lookback || 5;
 var n = candles.length;
-var swingHighs = [], swingLows = [];
+var highs = [], lows = [];
 for (var i = lookback; i < n - lookback; i++) {
 var isHigh = true, isLow = true;
 for (var j = i - lookback; j <= i + lookback; j++) {
@@ -198,70 +168,75 @@ if (j === i) continue;
 if (candles[j].high >= candles[i].high) isHigh = false;
 if (candles[j].low  <= candles[i].low)  isLow  = false;
 }
-if (isHigh) swingHighs.push({ price: candles[i].high, idx: i });
-if (isLow)  swingLows.push({  price: candles[i].low,  idx: i });
+if (isHigh) highs.push({ price: candles[i].high, idx: i });
+if (isLow)  lows.push({  price: candles[i].low,  idx: i });
 }
-return { highs: swingHighs, lows: swingLows };
+return { highs: highs, lows: lows };
 }
 
-// Destek/Direnç zonları
-function findSRZones(candles, tolerance) {
-tolerance = tolerance || 0.005;
-var swings = findSwings(candles, 5);
+// Destek/Direnc zonlari — birden fazla kez test edilen seviyeler
+function findSRLevels(candles, direction, price) {
+var swings = findSwings(candles, 3);
+var tolerance = price * 0.005; // %0.5 tolerans
+
+// Tum swing seviyelerini topla
 var levels = [];
-swings.highs.forEach(function(h) { levels.push(h.price); });
-swings.lows.forEach(function(l)  { levels.push(l.price); });
+swings.highs.forEach(function(h) { levels.push({ price: h.price, type: “resistance” }); });
+swings.lows.forEach(function(l)  { levels.push({ price: l.price, type: “support” }); });
 
+// Birbirine yakin seviyeleri birlestir (zone olustur)
 var zones = [];
-levels.forEach(function(price) {
+levels.forEach(function(lv) {
 var found = false;
-zones.forEach(function(z) {
-if (Math.abs(z.price - price) / price < tolerance) {
-z.price = (z.price + price) / 2;
-z.strength++;
+for (var i = 0; i < zones.length; i++) {
+if (Math.abs(zones[i].price - lv.price) <= tolerance) {
+zones[i].price = (zones[i].price * zones[i].count + lv.price) / (zones[i].count + 1);
+zones[i].count++;
 found = true;
+break;
 }
+}
+if (!found) zones.push({ price: lv.price, count: 1 });
 });
-if (!found) zones.push({ price: price, strength: 1 });
-});
 
-return zones.filter(function(z) { return z.strength >= 2; })
-.sort(function(a, b) { return b.strength - a.strength; });
-}
+// Guc siralamasina gore sirala
+zones.sort(function(a, b) { return b.count - a.count; });
 
-// Fibonacci seviyeleri
-function calcFibLevels(swingLow, swingHigh, direction) {
-var diff = swingHigh - swingLow;
+// Long icin fiyatin ustundeki direncler, short icin fiyatin altindaki destekler
 if (direction === “long”) {
-return {
-tp1: swingHigh + diff * 0.382,
-tp2: swingHigh + diff * 0.618,
-tp3: swingHigh + diff * 1.000,
-sl:  swingLow  - diff * 0.236
-};
+return zones
+.filter(function(z) { return z.price > price * 1.003; })
+.sort(function(a, b) { return a.price - b.price; }) // en yakinden en uzaga
+.slice(0, 4);
 } else {
-return {
-tp1: swingLow  - diff * 0.382,
-tp2: swingLow  - diff * 0.618,
-tp3: swingLow  - diff * 1.000,
-sl:  swingHigh + diff * 0.236
-};
+return zones
+.filter(function(z) { return z.price < price * 0.997; })
+.sort(function(a, b) { return b.price - a.price; }) // en yakinden en uzaga
+.slice(0, 4);
 }
 }
 
-// Son swing high/low bul
-function getLastSwing(candles, direction) {
-var swings = findSwings(candles, 5);
+// SL icin son swing seviyesi
+function findSwingSL(candles, direction, price) {
+var swings = findSwings(candles, 4);
 if (direction === “long”) {
-var lows = swings.lows;
-return lows.length > 0 ? lows[lows.length - 1].price : null;
+// Fiyatin altindaki en yakin swing low
+var lows = swings.lows
+.filter(function(l) { return l.price < price; })
+.sort(function(a, b) { return b.price - a.price; }); // en yakinden
+if (lows.length > 0) return lows[0].price * 0.999; // biraz altina koy
+return price * 0.98; // bulamazsa %2 alt
 } else {
-var highs = swings.highs;
-return highs.length > 0 ? highs[highs.length - 1].price : null;
+// Fiyatin ustundeki en yakin swing high
+var highs = swings.highs
+.filter(function(h) { return h.price > price; })
+.sort(function(a, b) { return a.price - b.price; }); // en yakinden
+if (highs.length > 0) return highs[0].price * 1.001; // biraz ustune koy
+return price * 1.02; // bulamazsa %2 ust
 }
 }
 
-// ─── FİLTRELER ────────────────────────────────────────────────
+// ─── FILTRELER ───────────────────────────────────────────────
 
 function marketRegime(ind, n) {
 var atrVal = ind.atr[n], atrMA = avg(ind.atr, 20);
@@ -303,58 +278,42 @@ if (ind.ema9[n] < ind.ema21[n] && ind.ema21[n] < ind.ema50[n]) return “down”
 return “neutral”;
 }
 
-// ─── SKOR MOTORU (11 koşul) ───────────────────────────────────
+// ─── SKOR MOTORU ─────────────────────────────────────────────
 
 function scoreSignal(c1h, c15m, funding, direction, ob) {
 var score = 0, hits = [], atr = 0;
 try {
-var i1h  = computeAll(c1h);
-var i15  = computeAll(c15m);
-var n1h  = c1h.length  - 1;
-var n15  = c15m.length - 1;
+var i1h = computeAll(c1h);
+var i15 = computeAll(c15m);
+var n1h = c1h.length  - 1;
+var n15 = c15m.length - 1;
 var n15p = n15 - 1;
-
-```
 atr = i15.atr[n15] || 0;
 var volAvg = avg(i15.vols, 20);
-var atrAvg = avg(i15.atr,  20);
-var cvd    = i15.cvd;
-var cvdUp  = cvd[n15] > cvd[n15 - 5];
-
+var cvd = i15.cvd, cvdUp = cvd[n15] > cvd[n15 - 5];
 var srK  = i15.stochRsi[n15]  ? i15.stochRsi[n15].k  : null;
 var srD  = i15.stochRsi[n15]  ? i15.stochRsi[n15].d  : null;
 var srKp = i15.stochRsi[n15p] ? i15.stochRsi[n15p].k : null;
 var srDp = i15.stochRsi[n15p] ? i15.stochRsi[n15p].d : null;
-var macd15 = i15.macd[n15];
-var vol15  = c15m[n15].vol;
-var rsi7   = i15.rsi7[n15];
+var macd15  = i15.macd[n15];
+var vol15   = c15m[n15].vol;
+var rsi7    = i15.rsi7[n15];
 var close15 = c15m[n15].close;
 var vwap1h  = i1h.vwap[n1h];
 
+```
 if (direction === "long") {
-  // 1. 1h EMA dizilimi (trend yönü)
   if (i1h.ema9[n1h] > i1h.ema21[n1h] && i1h.ema21[n1h] > i1h.ema50[n1h]) { score++; hits.push("EMA1h"); }
-  // 2. 1h Supertrend yukarı
   if (i1h.supertrend[n1h] === 1) { score++; hits.push("ST1h"); }
-  // 3. Fiyat 1h VWAP üzeri
   if (close15 > vwap1h) { score++; hits.push("VWAP"); }
-  // 4. 15m EMA dizilimi
   if (i15.ema9[n15] > i15.ema21[n15] && i15.ema21[n15] > i15.ema50[n15]) { score++; hits.push("EMA15"); }
-  // 5. Stoch RSI crossover yukarı (15m)
   if (srK != null && srD != null && srK > srD && srKp <= srDp && srK > 20) { score++; hits.push("StRSI"); }
-  // 6. RSI(7) momentum
   if (rsi7 != null && rsi7 > 30 && rsi7 < 65) { score++; hits.push("RSI"); }
-  // 7. MACD histogram pozitif (15m)
   if (macd15 && macd15.histogram != null && macd15.histogram > 0) { score++; hits.push("MACD"); }
-  // 8. CVD pozitif (alış baskısı)
   if (cvdUp) { score++; hits.push("CVD"); }
-  // 9. Hacim spike
   if (vol15 > volAvg * VOL_SPIKE_MULT) { score++; hits.push("VOL"); }
-  // 10. Order book alıcı baskısı
   if (obImbalance(ob, "long")) { score++; hits.push("OB"); }
-  // 11. Funding uygun
   if (funding !== null && funding < FUNDING_LONG_MAX) { score++; hits.push("FUND"); }
-
 } else {
   if (i1h.ema9[n1h] < i1h.ema21[n1h] && i1h.ema21[n1h] < i1h.ema50[n1h]) { score++; hits.push("EMA1h"); }
   if (i1h.supertrend[n1h] === -1) { score++; hits.push("ST1h"); }
@@ -374,7 +333,7 @@ if (direction === "long") {
 return { score: score, hits: hits, atr: atr };
 }
 
-// ─── TELEGRAM ─────────────────────────────────────────────────
+// ─── TELEGRAM ────────────────────────────────────────────────
 
 async function sendTelegram(text) {
 if (!TG_BOT_TOKEN || !TG_CHAT_ID) { console.warn(”[WARN] Token eksik”); return; }
@@ -394,53 +353,56 @@ if (p < 10000)  return p.toFixed(2);
 return p.toFixed(1);
 }
 
-function buildMessage(symbol, direction, price, score, hits, funding, fib, swingSL) {
+function pct(a, b) { return ((a - b) / b * 100).toFixed(2); }
+
+function buildMessage(symbol, direction, price, score, hits, funding, sl, tps) {
 var emoji = direction === “long” ? “🟢” : “🔴”;
 var dirTr = direction === “long” ? “LONG  ▲” : “SHORT ▼”;
+var lev   = 20;
 
-var sl  = swingSL;
-var tp1 = fib.tp1;
-var tp2 = fib.tp2;
-var tp3 = fib.tp3;
-
-var slPct  = (Math.abs(price - sl)  / price * 100).toFixed(2);
-var tp1Pct = (Math.abs(tp1 - price) / price * 100).toFixed(2);
-var tp2Pct = (Math.abs(tp2 - price) / price * 100).toFixed(2);
-var tp3Pct = (Math.abs(tp3 - price) / price * 100).toFixed(2);
-var rr     = (parseFloat(tp2Pct) / parseFloat(slPct)).toFixed(1);
-
-var lev     = 20;
-var p1pct   = (parseFloat(tp1Pct) * lev).toFixed(0);
-var p2pct   = (parseFloat(tp2Pct) * lev).toFixed(0);
-var p3pct   = (parseFloat(tp3Pct) * lev).toFixed(0);
-var losspct = (parseFloat(slPct)  * lev).toFixed(0);
-
+var slPct  = Math.abs(parseFloat(pct(sl, price)));
 var fundStr = funding !== null ? (funding * 100).toFixed(4) + “%” : “-”;
 var now     = new Date().toUTCString().slice(5, 25) + “ UTC”;
 var bar     = “█”.repeat(score) + “░”.repeat(11 - score);
 var tier    = score >= 10 ? “🔥 MUKEMMEL” : score === 9 ? “⭐ GUCLU” : “✅ IYI”;
 
+// TP satirlari
+var tpLines = “”;
+var tpEmojis = [“🎯”, “🎯”, “🎯”];
+var tpLabels = [“TP1”, “TP2”, “TP3”];
+var tpWeights = [”(%40 kapat)”, “(%40 kapat)”, “(%20 beklet)”];
+
+for (var i = 0; i < tps.length && i < 3; i++) {
+var tp = tps[i];
+var tpPct = parseFloat(pct(tp, price));
+var levPct = (tpPct * lev).toFixed(0);
+var sign = tpPct >= 0 ? “+” : “”;
+tpLines += tpEmojis[i] + “ <b>” + tpLabels[i] + “:</b>   “ + fmtPrice(tp) +
+“  (” + sign + tpPct.toFixed(2) + “% | 20x: “ + sign + “%” + levPct + “)  “ +
+“<i>” + tpWeights[i] + “</i>\n”;
+}
+
+var rr = tps.length > 1 ? (Math.abs(parseFloat(pct(tps[1], price))) / slPct).toFixed(1) : “-”;
+
 return emoji + “ <b>” + dirTr + “ — “ + symbol + “</b>\n” +
 “━━━━━━━━━━━━━━━━━━━━━━\n” +
 “💰 <b>Giris:</b>  “ + fmtPrice(price) + “\n\n” +
-“🎯 <b>TP1:</b>    “ + fmtPrice(tp1) + “  (+” + tp1Pct + “% / 20x: +%” + p1pct + “)\n” +
-“🎯 <b>TP2:</b>    “ + fmtPrice(tp2) + “  (+” + tp2Pct + “% / 20x: +%” + p2pct + “)\n” +
-“🎯 <b>TP3:</b>    “ + fmtPrice(tp3) + “  (+” + tp3Pct + “% / 20x: +%” + p3pct + “)\n” +
-“🛑 <b>SL:</b>     “ + fmtPrice(sl)  + “  (-”  + slPct  + “% / 20x: -%” + losspct + “)\n” +
+tpLines +
+“🛑 <b>SL:</b>     “ + fmtPrice(sl) + “  (-” + slPct.toFixed(2) + “% | 20x: -%” + (slPct * lev).toFixed(0) + “)\n” +
 “━━━━━━━━━━━━━━━━━━━━━━\n” +
 “📊 Skor: “ + bar + “ <b>” + score + “/11</b>  “ + tier + “\n” +
 “✅ <code>” + hits.join(” “) + “</code>\n” +
 “━━━━━━━━━━━━━━━━━━━━━━\n” +
 “⚖️ R:R: 1:” + rr + “  |  💸 Funding: “ + fundStr + “\n” +
-“⏱ TF: 1h trend + 15m giris\n” +
+“📐 TF: 1h trend + 15m giris\n” +
+“📌 SL: Son swing “ + (direction === “long” ? “low” : “high”) + “\n” +
+“📌 TP: Destek/Direnc zonlari\n” +
 “━━━━━━━━━━━━━━━━━━━━━━\n” +
-“💡 <i>TP1’de %40 kapat → SL’i girise cek\n” +
-“TP2’de %40 kapat → TP3 icin %20 beklet</i>\n” +
 “🕒 “ + now + “\n” +
 “<i>⚠ Ticaret tavsiyesi degildir.</i>”;
 }
 
-// ─── TEK COİN TARAMA ──────────────────────────────────────────
+// ─── TEK COIN TARAMA ─────────────────────────────────────────
 
 async function scanCoin(symbol) {
 try {
@@ -450,23 +412,17 @@ var price = parseFloat(ticker.price || 0);
 if (price <= 0) return;
 
 ```
-// 1h + 15m + funding + OB paralel
 var results = await Promise.all([
-  fetchCandles(symbol, "1h",  150),
-  fetchCandles(symbol, "15m", 150),
+  fetchCandles(symbol, "1h",  200),
+  fetchCandles(symbol, "15m", 200),
   fetchFunding(symbol),
   fetchOrderbook(symbol)
 ]);
 
-var c1h     = results[0];
-var c15m    = results[1];
-var funding = results[2];
-var ob      = results[3];
-
+var c1h = results[0], c15m = results[1], funding = results[2], ob = results[3];
 if (!c1h || !c15m) return;
 if (c1h.length < 60 || c15m.length < 60) return;
 
-// ATR filtresi
 var atr1 = calcATR(c15m, 14);
 var atrVal = atr1[atr1.length - 1], atrMA = avg(atr1, 20);
 if (!atrVal || atrVal < atrMA * ATR_MIN_RATIO) return;
@@ -474,68 +430,78 @@ if (!atrVal || atrVal < atrMA * ATR_MIN_RATIO) return;
 var i15m = computeAll(c15m);
 var n15  = c15m.length - 1;
 
-// Piyasa rejimi
 var regime = marketRegime(i15m, n15);
 if (regime === "volatile") return;
-
-// BTC filtresi
-if (BTC_FILTER && symbol !== "BTCUSDT") {
-  if (btcTrend === "down" && true) {} // long için kontrol scoreSignal içinde
-}
 
 for (var d = 0; d < 2; d++) {
   var direction = d === 0 ? "long" : "short";
   var key = symbol + "_" + direction;
   if (Date.now() - (lastSignal[key] || 0) < COOLDOWN_MS) continue;
 
-  // Diverjans filtresi
   if (detectDivergence(c15m, i15m.rsi14, direction, n15)) continue;
 
-  // BTC korelasyon
   if (BTC_FILTER && symbol !== "BTCUSDT") {
     if (direction === "long"  && btcTrend === "down") continue;
     if (direction === "short" && btcTrend === "up")   continue;
   }
 
-  // Range piyasada sadece reversal değil trend sinyali
   if (regime === "range") continue;
 
-  // Skor
   var result = scoreSignal(c1h, c15m, funding, direction, ob);
   if (result.score < MIN_SCORE) continue;
 
-  // Swing bazlı SL
-  var swingSL = getLastSwing(c15m, direction);
-  if (!swingSL) continue;
+  // Swing bazli SL
+  var sl = findSwingSL(c15m, direction, price);
 
-  // SL çok uzaksa atla (pozisyon boyutu yönetimi)
-  var slDist = Math.abs(price - swingSL) / price;
-  if (slDist > 0.05) continue; // %5'ten uzak SL → atla
-  if (slDist < 0.003) continue; // %0.3'ten yakın SL → çok dar
+  // SL mantikli mi kontrol
+  if (direction === "long"  && sl >= price) continue;
+  if (direction === "short" && sl <= price) continue;
 
-  // Fibonacci TP seviyeleri
-  var swings   = findSwings(c15m, 5);
-  var recentHighs = swings.highs.slice(-3);
-  var recentLows  = swings.lows.slice(-3);
+  var slDist = Math.abs(price - sl) / price;
+  if (slDist > 0.06) continue;  // %6'dan uzak SL -> atla
+  if (slDist < 0.002) continue; // %0.2'den yakin -> cok dar
 
-  var swingHigh = recentHighs.length > 0 ? Math.max.apply(null, recentHighs.map(function(h) { return h.price; })) : price * 1.02;
-  var swingLow  = recentLows.length  > 0 ? Math.min.apply(null, recentLows.map(function(l)  { return l.price; })) : price * 0.98;
+  // Destek/Direnc bazli TP'ler
+  var srZones = findSRLevels(c15m, direction, price);
 
-  var fib = calcFibLevels(swingLow, swingHigh, direction);
+  // 1h'tan da SR zonlari ekle (daha guclu seviyeler)
+  var srZones1h = findSRLevels(c1h, direction, price);
 
-  // TP'ler mantıklı mı kontrol et
+  // Birlesik zon listesi
+  var allZones = srZones.concat(srZones1h);
+  var tol = price * 0.005;
+  var merged = [];
+  allZones.forEach(function(z) {
+    var found = false;
+    for (var i = 0; i < merged.length; i++) {
+      if (Math.abs(merged[i].price - z.price) <= tol) {
+        merged[i].count += z.count;
+        found = true; break;
+      }
+    }
+    if (!found) merged.push({ price: z.price, count: z.count });
+  });
+
+  // Sirala ve en guclu 3 TP al
   if (direction === "long") {
-    if (fib.tp1 <= price || fib.tp2 <= fib.tp1) continue;
+    merged = merged.filter(function(z) { return z.price > price * 1.003; })
+                   .sort(function(a, b) { return a.price - b.price; });
   } else {
-    if (fib.tp1 >= price || fib.tp2 >= fib.tp1) continue;
+    merged = merged.filter(function(z) { return z.price < price * 0.997; })
+                   .sort(function(a, b) { return b.price - a.price; });
   }
 
-  // R:R kontrolü — minimum 1:2
-  var rrRatio = Math.abs(fib.tp2 - price) / Math.abs(price - swingSL);
-  if (rrRatio < 2.0) continue;
+  // En az 1 TP gerekli
+  if (merged.length === 0) continue;
+
+  var tps = merged.slice(0, 3).map(function(z) { return z.price; });
+
+  // R:R kontrolu minimum 1:1.5
+  var rrRatio = Math.abs(tps[0] - price) / Math.abs(price - sl);
+  if (rrRatio < 1.5) continue;
 
   console.log("🚀 SINYAL → " + symbol + " " + direction.toUpperCase() + " " + result.score + "/11 " + result.hits.join(" "));
-  var msg = buildMessage(symbol, direction, price, result.score, result.hits, funding, fib, swingSL);
+  var msg = buildMessage(symbol, direction, price, result.score, result.hits, funding, sl, tps);
   await sendTelegram(msg);
   lastSignal[key] = Date.now();
 }
@@ -544,7 +510,7 @@ for (var d = 0; d < 2; d++) {
 } catch(e) { console.error(”[ERR] “ + symbol + “: “ + e.message); }
 }
 
-// ─── ANA DÖNGÜ ────────────────────────────────────────────────
+// ─── ANA DONGU ───────────────────────────────────────────────
 
 async function runBatch(list) {
 for (var i = 0; i < list.length; i += CONCURRENT) {
@@ -556,17 +522,19 @@ function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
 
 async function main() {
 console.log(”=”.repeat(55));
-console.log(”  Binance Futures Intraday Scanner”);
+console.log(”  Binance Futures Intraday Scanner v2”);
 console.log(”  TF: 1h trend + 15m giris”);
-console.log(”  Swing SL + Fibonacci TP + CVD”);
-console.log(”  Min skor: “ + MIN_SCORE + “/11 | R:R min 1:2”);
+console.log(”  SL: Son swing high/low (grafik bazli)”);
+console.log(”  TP: Destek/Direnc zonlari (grafik bazli)”);
+console.log(”  Min skor: “ + MIN_SCORE + “/11 | R:R min 1:1.5”);
 console.log(”=”.repeat(55));
 
 await sendTelegram(
-“🤖 <b>Binance Intraday Scanner aktif</b>\n” +
-“TF: 1h + 15m | Skor: “ + MIN_SCORE + “/11\n” +
-“Swing SL + Fibonacci TP + CVD\n” +
-“Min R:R: 1:2 | Cooldown: “ + (COOLDOWN_MS/60000) + “dk”
+“🤖 <b>Binance Intraday Scanner v2 aktif</b>\n” +
+“TF: 1h + 15m\n” +
+“SL: Swing high/low\n” +
+“TP: Destek/Direnc zonlari\n” +
+“Min skor: “ + MIN_SCORE + “/11 | R:R min 1:1.5”
 );
 
 var cycle = 0;
@@ -582,7 +550,6 @@ if (cycle === 1 || cycle % 10 === 0) {
   if (!watchlist.length) { await sleep(30000); continue; }
 }
 
-// BTC trend güncelle
 try {
   var btcC = await fetchCandles("BTCUSDT", "1h", 60);
   if (btcC) { btcTrend = getBtcTrend(btcC); console.log("BTC: " + btcTrend.toUpperCase()); }
