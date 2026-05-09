@@ -15,8 +15,7 @@ const FUNDING_SHORT_MIN = 0.0002;
 const COOLDOWN_MS       = 900000;
 const CONCURRENT        = 8;
 const BTC_FILTER        = true;
-const ATR_MIN_RATIO     = 0.8;
-const VOL_SPIKE_MULT    = 1.8;
+const VOL_SPIKE_MULT    = 1.5;
 
 const lastSignal = {};
 let   btcTrend   = “neutral”;
@@ -52,7 +51,7 @@ return filtered;
 }
 
 async function fetchCandles(symbol, interval, limit) {
-const data = await binanceGet(”/fapi/v1/klines”, { symbol: symbol, interval: interval, limit: limit || 150 });
+const data = await binanceGet(”/fapi/v1/klines”, { symbol: symbol, interval: interval, limit: limit || 200 });
 if (!data || !data.length) return null;
 return data.map(function(r) {
 return { ts: r[0], open: parseFloat(r[1]), high: parseFloat(r[2]), low: parseFloat(r[3]), close: parseFloat(r[4]), vol: parseFloat(r[5]) };
@@ -87,10 +86,6 @@ low: candles.map(function(c) { return c.low; }),
 close: candles.map(function(c) { return c.close; }),
 period: period || 14
 }), candles.length);
-}
-function calcBBWidth(closes) {
-var bb = ti.BollingerBands.calculate({ period: 20, values: closes, stdDev: 2 });
-return pad(bb.map(function(b) { return (b.upper - b.lower) / b.middle; }), closes.length);
 }
 function calcVWAP(candles) {
 var cumPV = 0, cumVol = 0;
@@ -132,83 +127,158 @@ if (!vals.length) return 0;
 return vals.reduce(function(a, b) { return a + b; }, 0) / vals.length;
 }
 
-// ─── PRICE ACTION ────────────────────────────────────────────
+// ─── PULLBACK SISTEMI ─────────────────────────────────────────
+//
+// Mantik:
+// 1. 4h/1h’ta GUCLU trend var mi? (EMA + Supertrend)
+// 2. 15m’de GERI CEKILME oldu mu? (RSI dusuk, fiyat EMA’ya yaklasti)
+// 3. Geri cekilme BITTI mi? (Bullish reversal mumlar)
+// 4. Hacim geri donus mumunda artiyor mu?
+//
+// Bu sistem trend BASINDA degil, geri cekilme SONRASINDA girer.
+// Cok daha gec deger degil, cok daha GUVENLI giriyor.
 
-// Bullish Engulfing: onceki kirmizi mum, simdi yesil ve daha buyuk
-function isBullishEngulfing(candles, n) {
-if (n < 1) return false;
-var prev = candles[n-1], curr = candles[n];
-return prev.close < prev.open &&
-curr.close > curr.open &&
-curr.open < prev.close &&
-curr.close > prev.open;
-}
+// 4h guclu trend kontrolu
+function isStrongTrend4h(c4h, direction) {
+var closes = c4h.map(function(c) { return c.close; });
+var ema21 = calcEMA(closes, 21);
+var ema50 = calcEMA(closes, 50);
+var st    = calcSupertrend(c4h, 10, 3);
+var n     = c4h.length - 1;
 
-// Bearish Engulfing: onceki yesil mum, simdi kirmizi ve daha buyuk
-function isBearishEngulfing(candles, n) {
-if (n < 1) return false;
-var prev = candles[n-1], curr = candles[n];
-return prev.close > prev.open &&
-curr.close < curr.open &&
-curr.open > prev.close &&
-curr.close < prev.open;
-}
-
-// Bullish Pin Bar: alt fitil uzun, ust fitil kisa (hammer)
-function isBullishPinBar(candles, n) {
-var c = candles[n];
-var body   = Math.abs(c.close - c.open);
-var lowerW = Math.min(c.open, c.close) - c.low;
-var upperW = c.high - Math.max(c.open, c.close);
-if (body === 0) return false;
-return lowerW >= body * 2 && upperW <= body * 0.5;
-}
-
-// Bearish Pin Bar: ust fitil uzun, alt fitil kisa (shooting star)
-function isBearishPinBar(candles, n) {
-var c = candles[n];
-var body   = Math.abs(c.close - c.open);
-var upperW = c.high - Math.max(c.open, c.close);
-var lowerW = Math.min(c.open, c.close) - c.low;
-if (body === 0) return false;
-return upperW >= body * 2 && lowerW <= body * 0.5;
-}
-
-// Higher High / Higher Low yapisi (yukselis trendi)
-function isHigherHighHL(candles, n, lookback) {
-lookback = lookback || 10;
-if (n < lookback * 2) return false;
-var recent = candles.slice(n - lookback, n + 1);
-var prev   = candles.slice(n - lookback * 2, n - lookback + 1);
-var recentHigh = Math.max.apply(null, recent.map(function(c) { return c.high; }));
-var recentLow  = Math.min.apply(null, recent.map(function(c) { return c.low; }));
-var prevHigh   = Math.max.apply(null, prev.map(function(c) { return c.high; }));
-var prevLow    = Math.min.apply(null, prev.map(function(c) { return c.low; }));
-return recentHigh > prevHigh && recentLow > prevLow;
-}
-
-// Lower Low / Lower High yapisi (dusus trendi)
-function isLowerLowLH(candles, n, lookback) {
-lookback = lookback || 10;
-if (n < lookback * 2) return false;
-var recent = candles.slice(n - lookback, n + 1);
-var prev   = candles.slice(n - lookback * 2, n - lookback + 1);
-var recentHigh = Math.max.apply(null, recent.map(function(c) { return c.high; }));
-var recentLow  = Math.min.apply(null, recent.map(function(c) { return c.low; }));
-var prevHigh   = Math.max.apply(null, prev.map(function(c) { return c.high; }));
-var prevLow    = Math.min.apply(null, prev.map(function(c) { return c.low; }));
-return recentLow < prevLow && recentHigh < prevHigh;
-}
-
-// VWAP kirilmasi: fiyat VWAP’i yukari/asagi kirdi mi
-function isVWAPBreak(candles, vwap, n, direction) {
-if (n < 2) return false;
-var prev = candles[n-1], curr = candles[n];
 if (direction === “long”) {
-return prev.close < vwap[n-1] && curr.close > vwap[n];
+// 4h’ta EMA21 > EMA50 ve Supertrend yukari
+return ema21[n] > ema50[n] && st[n] === 1;
 } else {
-return prev.close > vwap[n-1] && curr.close < vwap[n];
+return ema21[n] < ema50[n] && st[n] === -1;
 }
+}
+
+// 1h trend teyidi
+function isTrend1h(c1h, direction) {
+var closes = c1h.map(function(c) { return c.close; });
+var ema9  = calcEMA(closes, 9);
+var ema21 = calcEMA(closes, 21);
+var n     = c1h.length - 1;
+
+if (direction === “long”)  return ema9[n] > ema21[n];
+if (direction === “short”) return ema9[n] < ema21[n];
+return false;
+}
+
+// 15m’de geri cekilme var mi?
+// Long icin: RSI dusmus (30-50 arasi), fiyat EMA21’e yaklasmiş
+function isPullback(c15m, direction) {
+var closes = c15m.map(function(c) { return c.close; });
+var ema21  = calcEMA(closes, 21);
+var rsi    = calcRSI(closes, 14);
+var n      = c15m.length - 1;
+
+var price  = closes[n];
+var e21    = ema21[n];
+var r      = rsi[n];
+
+if (!r || !e21) return false;
+
+if (direction === “long”) {
+// Fiyat EMA21’e yaklasti (ema21’in %1 icinde) ve RSI 35-55 arasi (geri cekilme bolge)
+var nearEMA = Math.abs(price - e21) / e21 < 0.015;
+var rsiPB   = r >= 30 && r <= 55;
+return nearEMA || rsiPB;
+} else {
+var nearEMA = Math.abs(price - e21) / e21 < 0.015;
+var rsiPB   = r >= 45 && r <= 70;
+return nearEMA || rsiPB;
+}
+}
+
+// Geri cekilme bitti mi? (Reversal sinyali)
+// Bullish pin bar, engulfing veya RSI yeniden yukari donuyor
+function isPullbackEnd(c15m, direction) {
+var n      = c15m.length - 1;
+var closes = c15m.map(function(c) { return c.close; });
+var rsi    = calcRSI(closes, 14);
+var cvd    = calcCVD(c15m);
+
+var curr = c15m[n];
+var prev = c15m[n-1];
+var r    = rsi[n];
+var rp   = rsi[n-1];
+
+if (!r || !rp) return false;
+
+if (direction === “long”) {
+// Bullish engulfing
+var engulf = prev.close < prev.open &&
+curr.close > curr.open &&
+curr.close > prev.open &&
+curr.open < prev.close;
+
+```
+// Bullish pin bar (hammer)
+var body   = Math.abs(curr.close - curr.open);
+var lowerW = Math.min(curr.open, curr.close) - curr.low;
+var upperW = curr.high - Math.max(curr.open, curr.close);
+var pinBar = body > 0 && lowerW >= body * 1.5 && upperW <= body * 0.5;
+
+// RSI yukari donuyor
+var rsiTurn = r > rp && r >= 40;
+
+// CVD artiyor
+var cvdUp = cvd[n] > cvd[n-3];
+
+return (engulf || pinBar) && (rsiTurn || cvdUp);
+```
+
+} else {
+// Bearish engulfing
+var engulf = prev.close > prev.open &&
+curr.close < curr.open &&
+curr.close < prev.open &&
+curr.open > prev.close;
+
+```
+// Shooting star
+var body   = Math.abs(curr.close - curr.open);
+var upperW = curr.high - Math.max(curr.open, curr.close);
+var lowerW = Math.min(curr.open, curr.close) - curr.low;
+var pinBar = body > 0 && upperW >= body * 1.5 && lowerW <= body * 0.5;
+
+// RSI asagi donuyor
+var rsiTurn = r < rp && r <= 60;
+
+// CVD azaliyor
+var cvdDown = cvd[n] < cvd[n-3];
+
+return (engulf || pinBar) && (rsiTurn || cvdDown);
+```
+
+}
+}
+
+// Hacim dogrulama: geri donus mumunda hacim artmali
+function isVolumeConfirm(c15m) {
+var n      = c15m.length - 1;
+var volAvg = avg(c15m.map(function(c) { return c.vol; }), 20);
+return c15m[n].vol > volAvg * VOL_SPIKE_MULT;
+}
+
+// VWAP pozisyonu
+function isAboveVWAP(c1h, direction) {
+var vwap  = calcVWAP(c1h);
+var n     = c1h.length - 1;
+var price = c1h[n].close;
+if (direction === “long”)  return price > vwap[n];
+if (direction === “short”) return price < vwap[n];
+return false;
+}
+
+// Funding rate kontrolu
+function isFundingOk(funding, direction) {
+if (funding === null) return true;
+if (direction === “long”)  return funding < FUNDING_LONG_MAX;
+if (direction === “short”) return funding > FUNDING_SHORT_MIN;
+return true;
 }
 
 // ─── SR ZONLARI ──────────────────────────────────────────────
@@ -231,9 +301,9 @@ return { highs: highs, lows: lows };
 }
 
 function findSRLevels(candles, direction, price) {
-var swings = findSwings(candles, 3);
+var swings    = findSwings(candles, 3);
 var tolerance = price * 0.005;
-var levels = [];
+var levels    = [];
 swings.highs.forEach(function(h) { levels.push({ price: h.price }); });
 swings.lows.forEach(function(l)  { levels.push({ price: l.price }); });
 
@@ -259,8 +329,8 @@ return zones.filter(function(z) { return z.price < price * 0.997; })
 }
 }
 
-function findSwingSL(candles, direction, price) {
-var swings = findSwings(candles, 4);
+function findSwingSL(c15m, direction, price) {
+var swings = findSwings(c15m, 4);
 if (direction === “long”) {
 var lows = swings.lows.filter(function(l) { return l.price < price; })
 .sort(function(a, b) { return b.price - a.price; });
@@ -274,86 +344,39 @@ return price * 1.03;
 }
 }
 
-// ─── SKOR MOTORU (8 guclu kosul) ─────────────────────────────
+// ─── ANA SINYAL MOTORU ───────────────────────────────────────
 
-function scoreSignal(c1h, c15m, funding, direction) {
+function scoreSignal(c4h, c1h, c15m, funding, direction) {
 var score = 0, hits = [];
 
-try {
-var closes1h  = c1h.map(function(c) { return c.close; });
-var closes15m = c15m.map(function(c) { return c.close; });
+// 1. 4h guclu trend (ZORUNLU - biri saglanmali)
+var strong4h = isStrongTrend4h(c4h, direction);
+if (strong4h) { score++; hits.push(“4hTREND”); }
 
-```
-var ema9_1h  = calcEMA(closes1h, 9);
-var ema21_1h = calcEMA(closes1h, 21);
-var st1h     = calcSupertrend(c1h, 10, 3);
-var vwap1h   = calcVWAP(c1h);
-var vwap15m  = calcVWAP(c15m);
-var ema9_15  = calcEMA(closes15m, 9);
-var ema21_15 = calcEMA(closes15m, 21);
-var rsi7     = calcRSI(closes15m, 7);
-var cvd      = calcCVD(c15m);
-var atr15    = calcATR(c15m, 14);
-var bbw      = calcBBWidth(closes15m);
+// 2. 1h trend teyidi
+var trend1h = isTrend1h(c1h, direction);
+if (trend1h) { score++; hits.push(“1hTREND”); }
 
-var n1h  = c1h.length  - 1;
-var n15  = c15m.length - 1;
+// 3. 15m’de geri cekilme var (pullback bolgesi)
+var pullback = isPullback(c15m, direction);
+if (pullback) { score++; hits.push(“PULLBACK”); }
 
-var volAvg = avg(c15m.map(function(c) { return c.vol; }), 20);
-var atrAvg = avg(atr15, 20);
-var atrVal = atr15[n15] || 0;
-var cvdUp  = cvd[n15] > cvd[n15 - 5];
-var vol15  = c15m[n15].vol;
+// 4. Geri cekilme bitti (reversal sinyali) - EN ONEMLI
+var pbEnd = isPullbackEnd(c15m, direction);
+if (pbEnd) { score++; hits.push(“REVERSAL”); }
 
-if (direction === "long") {
+// 5. Hacim dogrulama
+var volOk = isVolumeConfirm(c15m);
+if (volOk) { score++; hits.push(“VOL”); }
 
-  // 1. 1h EMA trend yukari
-  if (ema9_1h[n1h] > ema21_1h[n1h]) { score++; hits.push("EMA1h"); }
+// 6. VWAP pozisyonu
+var vwapOk = isAboveVWAP(c1h, direction);
+if (vwapOk) { score++; hits.push(“VWAP”); }
 
-  // 2. 1h Supertrend yukari
-  if (st1h[n1h] === 1) { score++; hits.push("ST"); }
+// 7. Funding rate
+var fundOk = isFundingOk(funding, direction);
+if (fundOk) { score++; hits.push(“FUND”); }
 
-  // 3. VWAP kirilmasi (15m) VEYA fiyat VWAP ustunde
-  var vwapBreak = isVWAPBreak(c15m, vwap15m, n15, "long");
-  var aboveVWAP = c15m[n15].close > vwap1h[n1h];
-  if (vwapBreak || aboveVWAP) { score++; hits.push("VWAP"); }
-
-  // 4. Price action: Engulfing VEYA Pin Bar VEYA HH/HL
-  var pa = isBullishEngulfing(c15m, n15) || isBullishPinBar(c15m, n15) || isHigherHighHL(c15m, n15, 8);
-  if (pa) { score++; hits.push("PA"); }
-
-  // 5. 15m EMA yukari
-  if (ema9_15[n15] > ema21_15[n15]) { score++; hits.push("EMA15"); }
-
-  // 6. CVD pozitif
-  if (cvdUp) { score++; hits.push("CVD"); }
-
-  // 7. Hacim spike
-  if (vol15 > volAvg * VOL_SPIKE_MULT) { score++; hits.push("VOL"); }
-
-  // 8. Funding uygun
-  if (funding !== null && funding < FUNDING_LONG_MAX) { score++; hits.push("FUND"); }
-
-} else {
-
-  if (ema9_1h[n1h] < ema21_1h[n1h]) { score++; hits.push("EMA1h"); }
-  if (st1h[n1h] === -1) { score++; hits.push("ST"); }
-
-  var vwapBreakS = isVWAPBreak(c15m, vwap15m, n15, "short");
-  var belowVWAP  = c15m[n15].close < vwap1h[n1h];
-  if (vwapBreakS || belowVWAP) { score++; hits.push("VWAP"); }
-
-  var paS = isBearishEngulfing(c15m, n15) || isBearishPinBar(c15m, n15) || isLowerLowLH(c15m, n15, 8);
-  if (paS) { score++; hits.push("PA"); }
-
-  if (ema9_15[n15] < ema21_15[n15]) { score++; hits.push("EMA15"); }
-  if (!cvdUp) { score++; hits.push("CVD"); }
-  if (vol15 > volAvg * VOL_SPIKE_MULT) { score++; hits.push("VOL"); }
-  if (funding !== null && funding > FUNDING_SHORT_MIN) { score++; hits.push("FUND"); }
-}
-```
-
-} catch(e) { console.debug(”[SCORE ERR]”, e.message); }
 return { score: score, hits: hits };
 }
 
@@ -384,11 +407,11 @@ var dirTr = direction === “long” ? “LONG  ▲” : “SHORT ▼”;
 var slPct   = (Math.abs(price - sl) / price * 100).toFixed(2);
 var fundStr = funding !== null ? (funding * 100).toFixed(4) + “%” : “-”;
 var now     = new Date().toUTCString().slice(5, 25) + “ UTC”;
-var bar     = “█”.repeat(score) + “░”.repeat(8 - score);
-var tier    = score === 8 ? “🔥 MUKEMMEL” : score === 7 ? “⭐ GUCLU” : “✅ IYI”;
+var bar     = “█”.repeat(score) + “░”.repeat(7 - score);
+var tier    = score === 7 ? “🔥 MUKEMMEL” : score === 6 ? “⭐ GUCLU” : “✅ IYI”;
 
 var tpLines = “”;
-var tpLabels = [“TP1”, “TP2”, “TP3”];
+var tpLabels  = [“TP1”, “TP2”, “TP3”];
 var tpWeights = [”(%40)”, “(%40)”, “(%20)”];
 for (var i = 0; i < tps.length && i < 3; i++) {
 var tpPct = (Math.abs(tps[i] - price) / price * 100).toFixed(2);
@@ -398,7 +421,9 @@ tpLines += “🎯 <b>” + tpLabels[i] + “:</b> “ + fmtPrice(tps[i]) +
 “  (” + sign + tpPct + “% | 20x:” + sign + “%” + lev20 + “) “ + tpWeights[i] + “\n”;
 }
 
-var rr = tps.length > 0 ? (parseFloat((Math.abs(tps[0] - price) / price * 100).toFixed(2)) / parseFloat(slPct)).toFixed(1) : “-”;
+var rr = tps.length > 0
+? (parseFloat((Math.abs(tps[0] - price) / price * 100).toFixed(2)) / parseFloat(slPct)).toFixed(1)
+: “-”;
 
 return emoji + “ <b>” + dirTr + “ — “ + symbol + “</b>\n” +
 “━━━━━━━━━━━━━━━━━━━━━━\n” +
@@ -406,14 +431,15 @@ return emoji + “ <b>” + dirTr + “ — “ + symbol + “</b>\n” +
 tpLines +
 “🛑 <b>SL:</b> “ + fmtPrice(sl) + “  (-” + slPct + “% | 20x:-%” + (parseFloat(slPct)*20).toFixed(0) + “)\n” +
 “━━━━━━━━━━━━━━━━━━━━━━\n” +
-“📊 Skor: “ + bar + “ <b>” + score + “/8</b>  “ + tier + “\n” +
+“📊 Skor: “ + bar + “ <b>” + score + “/7</b>  “ + tier + “\n” +
 “✅ <code>” + hits.join(” “) + “</code>\n” +
 “━━━━━━━━━━━━━━━━━━━━━━\n” +
 “⚖️ R:R: 1:” + rr + “ | 💸 Funding: “ + fundStr + “\n” +
-“📐 TF: 1h trend + 15m giris\n” +
-“📌 Price Action: Engulfing/PinBar/HH-HL\n” +
+“📐 Strateji: Pullback Entry\n” +
+“📌 4h trend + 1h teyit + 15m geri cekilme sonu\n” +
 “━━━━━━━━━━━━━━━━━━━━━━\n” +
-“💡 <i>Mum kapanisini bekle, sonra gir!</i>\n” +
+“💡 <i>Mum KAPANISINI bekle, sonra gir!\n” +
+“TP1’de %40 kapat, SL’i girise cek.</i>\n” +
 “🕒 “ + now + “\n” +
 “<i>⚠ Ticaret tavsiyesi degildir.</i>”;
 }
@@ -428,26 +454,17 @@ var price = parseFloat(ticker.price || 0);
 if (price <= 0) return;
 
 ```
+// 4h + 1h + 15m paralel cek
 var results = await Promise.all([
+  fetchCandles(symbol, "4h",  100),
   fetchCandles(symbol, "1h",  150),
-  fetchCandles(symbol, "15m", 150),
+  fetchCandles(symbol, "15m", 200),
   fetchFunding(symbol)
 ]);
 
-var c1h = results[0], c15m = results[1], funding = results[2];
-if (!c1h || !c15m || c1h.length < 50 || c15m.length < 50) return;
-
-// ATR filtresi - duz piyasada sinyal verme
-var atr15 = calcATR(c15m, 14);
-var atrVal = atr15[atr15.length - 1];
-var atrMA  = avg(atr15, 20);
-if (!atrVal || atrVal < atrMA * ATR_MIN_RATIO) return;
-
-// BB genislik filtresi - range piyasada sinyal verme
-var closes15m = c15m.map(function(c) { return c.close; });
-var bbw = calcBBWidth(closes15m);
-var bbwMA = avg(bbw, 20);
-if (bbw[bbw.length-1] < bbwMA * 0.65) return;
+var c4h = results[0], c1h = results[1], c15m = results[2], funding = results[3];
+if (!c4h || !c1h || !c15m) return;
+if (c4h.length < 30 || c1h.length < 50 || c15m.length < 50) return;
 
 for (var d = 0; d < 2; d++) {
   var direction = d === 0 ? "long" : "short";
@@ -460,8 +477,14 @@ for (var d = 0; d < 2; d++) {
     if (direction === "short" && btcTrend === "up")   continue;
   }
 
-  var result = scoreSignal(c1h, c15m, funding, direction);
+  // 4h trend ZORUNLU - yoksa devam etme
+  if (!isStrongTrend4h(c4h, direction)) continue;
+
+  var result = scoreSignal(c4h, c1h, c15m, funding, direction);
   if (result.score < MIN_SCORE) continue;
+
+  // Pullback ve reversal ikisi de olmali
+  if (!isPullback(c15m, direction) || !isPullbackEnd(c15m, direction)) continue;
 
   // SL hesapla
   var sl = findSwingSL(c15m, direction, price);
@@ -469,16 +492,16 @@ for (var d = 0; d < 2; d++) {
   if (direction === "short" && sl <= price) continue;
 
   var slDist = Math.abs(price - sl) / price;
-  if (slDist > 0.07) continue;
+  if (slDist > 0.06) continue;
   if (slDist < 0.003) continue;
 
-  // TP: destek/direnc zonlari
-  var srZones  = findSRLevels(c15m, direction, price);
-  var srZones1h= findSRLevels(c1h,  direction, price);
-  var allZones = srZones.concat(srZones1h);
-  var tol = price * 0.005;
+  // TP: SR zonlari
+  var sr15  = findSRLevels(c15m, direction, price);
+  var sr1h  = findSRLevels(c1h,  direction, price);
+  var all   = sr15.concat(sr1h);
+  var tol   = price * 0.005;
   var merged = [];
-  allZones.forEach(function(z) {
+  all.forEach(function(z) {
     var found = false;
     for (var i = 0; i < merged.length; i++) {
       if (Math.abs(merged[i].price - z.price) <= tol) {
@@ -504,7 +527,7 @@ for (var d = 0; d < 2; d++) {
   var rrRatio = Math.abs(tps[0] - price) / Math.abs(price - sl);
   if (rrRatio < 1.5) continue;
 
-  console.log("🚀 " + symbol + " " + direction.toUpperCase() + " " + result.score + "/8 " + result.hits.join(" "));
+  console.log("🚀 PULLBACK " + symbol + " " + direction.toUpperCase() + " " + result.score + "/7 " + result.hits.join(" "));
   await sendTelegram(buildMessage(symbol, direction, price, result.score, result.hits, funding, sl, tps));
   lastSignal[key] = Date.now();
 }
@@ -533,18 +556,20 @@ return “neutral”;
 
 async function main() {
 console.log(”=”.repeat(55));
-console.log(”  Binance Scalping Scanner v3 - Price Action Edition”);
-console.log(”  TF: 1h trend + 15m giris”);
-console.log(”  Price Action: Engulfing | Pin Bar | HH-HL”);
-console.log(”  SL: Swing high/low | TP: SR Zonlari”);
-console.log(”  Min skor: “ + MIN_SCORE + “/8 | R:R min 1:1.5”);
+console.log(”  Binance Pullback Scanner v4”);
+console.log(”  Strateji: Trend icinde geri cekilme sonu”);
+console.log(”  TF: 4h trend + 1h teyit + 15m giris”);
+console.log(”  Giris: Reversal mum + Hacim + RSI donus”);
+console.log(”  SL: Son swing | TP: SR Zonlari”);
+console.log(”  Min skor: “ + MIN_SCORE + “/7”);
 console.log(”=”.repeat(55));
 
 await sendTelegram(
-“🤖 <b>Scanner v3 - Price Action Edition</b>\n” +
-“Engulfing | Pin Bar | HH-HL | CVD\n” +
-“SL: Swing | TP: SR Zonlari\n” +
-“Min: “ + MIN_SCORE + “/8 | R:R 1:1.5”
+“🤖 <b>Pullback Scanner v4 aktif</b>\n” +
+“Strateji: Trend icinde geri cekilme sonu\n” +
+“TF: 4h + 1h + 15m\n” +
+“Giris: Reversal mum + Hacim + RSI donus\n” +
+“Min: “ + MIN_SCORE + “/7 | R:R 1:1.5”
 );
 
 var cycle = 0;
