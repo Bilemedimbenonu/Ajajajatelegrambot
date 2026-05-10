@@ -7,14 +7,55 @@ const TG_CHAT_ID       = process.env.TG_CHAT_ID   || “”;
 const BINANCE_BASE     = “https://fapi.binance.com”;
 
 const SCAN_INTERVAL_MS = 60000;
-const COOLDOWN_MS      = 600000;
-const CONCURRENT       = 10;
+const COOLDOWN_MS      = 1800000; // 30 dk ayni coin tekrar sinyal yok
 
 // Top 10 en yuksek hacimli coin
 const WATCHLIST = [
 “BTCUSDT”, “ETHUSDT”, “BNBUSDT”, “SOLUSDT”, “XRPUSDT”,
 “DOGEUSDT”, “ADAUSDT”, “AVAXUSDT”, “LINKUSDT”, “TONUSDT”
 ];
+
+// Gunluk sinyal yonetimi
+var dailyState = {
+date: “”,
+signalCount: 0,
+hasLoss: false,
+maxSignals: 2
+};
+
+function getTodayUTC() {
+var d = new Date();
+return d.getUTCFullYear() + “-” + (d.getUTCMonth()+1) + “-” + d.getUTCDate();
+}
+
+function resetDailyIfNeeded() {
+var today = getTodayUTC();
+if (dailyState.date !== today) {
+dailyState.date       = today;
+dailyState.signalCount = 0;
+dailyState.hasLoss    = false;
+console.log(”[RESET] Yeni gun: “ + today + “ | Sinyal sayaci sifirlandı”);
+}
+}
+
+function canSendSignal() {
+resetDailyIfNeeded();
+if (dailyState.hasLoss) {
+console.log(”[LIMIT] Bugun zarar var, sinyal gonderilmiyor”);
+return false;
+}
+if (dailyState.signalCount >= dailyState.maxSignals) {
+console.log(”[LIMIT] Gunluk max “ + dailyState.maxSignals + “ sinyal doldu”);
+return false;
+}
+return true;
+}
+
+// Session filtresi: 10:00-16:00 UTC (13:00-19:00 TR)
+function isSessionOk() {
+var hour = new Date().getUTCHours();
+return hour >= 10 && hour < 16;
+}
 
 const lastSignal = {};
 
@@ -96,12 +137,6 @@ return cum;
 });
 }
 
-function avg(arr, last) {
-var vals = arr.filter(function(v) { return v !== null; }).slice(-(last || 20));
-if (!vals.length) return 0;
-return vals.reduce(function(a, b) { return a + b; }, 0) / vals.length;
-}
-
 function calcSupertrend(candles, period, mult) {
 period = period || 10; mult = mult || 3.0;
 var atr = calcATR(candles, period), n = candles.length;
@@ -121,134 +156,148 @@ else { dir[i] = candles[i].close < lower[i] ? -1 : 1; st[i] = dir[i] === 1 ? low
 return dir;
 }
 
-// ─── VWAP BOUNCE SISTEMI ─────────────────────────────────────
-//
-// Strateji:
-// 1. 1h trend yukari/asagi (EMA + Supertrend)
-// 2. Fiyat VWAP’a yaklasti (bounce bolgesi)
-// 3. RSI geri cekilme bolgesinde (35-55 long, 45-65 short)
-// 4. VWAP’tan sekis basliyor (reversal mum)
-// 5. CVD destekliyor
-// 6. Hacim artisi var
-//
-// SL: VWAP’in %0.3 altı/ustu (net, tartismasiz)
-// TP1: ATR x1.5 | TP2: ATR x3.0 | TP3: ATR x5.0
+function avg(arr, last) {
+var vals = arr.filter(function(v) { return v !== null; }).slice(-(last || 20));
+if (!vals.length) return 0;
+return vals.reduce(function(a, b) { return a + b; }, 0) / vals.length;
+}
 
+// ─── PROFESYONEL VWAP BOUNCE FILTRELERI ──────────────────────
+
+// 1. VWAP Bounce - Cok siki
 function isVWAPBounce(candles, vwap, direction, n) {
 if (n < 3) return false;
-var price  = candles[n].close;
-var vwapN  = vwap[n];
-var vwapP  = vwap[n-1];
-if (!vwapN || !vwapP) return false;
+var price = candles[n].close;
+var vwapN = vwap[n];
+if (!vwapN) return false;
 
-// Fiyat VWAP’a ne kadar yakin? (max %0.5)
+// VWAP’a max %0.3 yakin (eskiden %0.5)
 var dist = Math.abs(price - vwapN) / vwapN;
-if (dist > 0.005) return false;
+if (dist > 0.003) return false;
 
-// Onceki bar VWAP’in altinda/ustunde miydi?
 var prev = candles[n-1];
 var curr = candles[n];
 
 if (direction === “long”) {
-// Fiyat VWAP altina inmis, simdi geri yukari doniyor
-var touchedBelow = prev.low < vwapP;
-var bouncingUp   = curr.close > curr.open; // yesil mum
-var aboveVWAP    = curr.close >= vwapN;
-return touchedBelow && bouncingUp && aboveVWAP;
+// Onceki mum VWAP’a dokunmus veya altina inmis
+var touchedVWAP = prev.low <= vwapN * 1.002;
+// Simdiki mum yesil ve VWAP uzerinde kapaniyor
+var greenCandle  = curr.close > curr.open;
+var aboveVWAP    = curr.close > vwapN;
+// Alt fitil uzun (bounce gostergesi)
+var body         = Math.abs(curr.close - curr.open);
+var lowerWick    = Math.min(curr.open, curr.close) - curr.low;
+var hasWick      = body > 0 && lowerWick >= body * 0.5;
+return touchedVWAP && greenCandle && aboveVWAP && hasWick;
 } else {
-// Fiyat VWAP ustune cikip geri asagi doniyor
-var touchedAbove = prev.high > vwapP;
-var bouncingDown = curr.close < curr.open; // kirmizi mum
-var belowVWAP    = curr.close <= vwapN;
-return touchedAbove && bouncingDown && belowVWAP;
+var touchedVWAP = prev.high >= vwapN * 0.998;
+var redCandle    = curr.close < curr.open;
+var belowVWAP    = curr.close < vwapN;
+var body         = Math.abs(curr.close - curr.open);
+var upperWick    = curr.high - Math.max(curr.open, curr.close);
+var hasWick      = body > 0 && upperWick >= body * 0.5;
+return touchedVWAP && redCandle && belowVWAP && hasWick;
 }
 }
 
-function isTrend1h(c1h, direction) {
+// 2. 1h Guclu trend - Hem EMA hem Supertrend zorunlu
+function isStrongTrend1h(c1h, direction) {
 var closes = c1h.map(function(c) { return c.close; });
 var ema9   = calcEMA(closes, 9);
 var ema21  = calcEMA(closes, 21);
+var ema50  = calcEMA(closes, 50);
 var st     = calcSupertrend(c1h, 10, 3);
 var n      = c1h.length - 1;
-if (direction === “long”)  return ema9[n] > ema21[n] && st[n] === 1;
-if (direction === “short”) return ema9[n] < ema21[n] && st[n] === -1;
+if (direction === “long”)
+return ema9[n] > ema21[n] && ema21[n] > ema50[n] && st[n] === 1;
+if (direction === “short”)
+return ema9[n] < ema21[n] && ema21[n] < ema50[n] && st[n] === -1;
 return false;
 }
 
-function isRSIOk(candles, direction, n) {
+// 3. RSI cok siki bant
+function isRSIStrong(candles, direction, n) {
 var closes = candles.map(function(c) { return c.close; });
 var rsi    = calcRSI(closes, 14);
-var r      = rsi[n];
-if (!r) return false;
-if (direction === “long”)  return r >= 30 && r <= 58;
-if (direction === “short”) return r >= 42 && r <= 70;
-return false;
+var rsiPrev = rsi[n-1];
+var rsiCurr = rsi[n];
+if (!rsiCurr || !rsiPrev) return false;
+
+if (direction === “long”) {
+// RSI 32-50 arasi VE yukari doniyor
+return rsiCurr >= 32 && rsiCurr <= 50 && rsiCurr > rsiPrev;
+} else {
+// RSI 50-68 arasi VE asagi doniyor
+return rsiCurr >= 50 && rsiCurr <= 68 && rsiCurr < rsiPrev;
+}
 }
 
-function isCVDOk(candles, direction, n) {
+// 4. CVD zorunlu (opsiyonel degil)
+function isCVDConfirm(candles, direction, n) {
 var cvd   = calcCVD(candles);
-var cvdUp = cvd[n] > cvd[n-3];
+// Son 5 mumda CVD trendi
+var cvdUp = cvd[n] > cvd[n-5] && cvd[n] > cvd[n-2];
 return direction === “long” ? cvdUp : !cvdUp;
 }
 
-function isVolumeOk(candles, n) {
+// 5. Yuksek hacim spike (×2.5)
+function isHighVolume(candles, n) {
 var vols   = candles.map(function(c) { return c.vol; });
 var volAvg = avg(vols, 20);
-return candles[n].vol > volAvg * 1.3;
+return candles[n].vol > volAvg * 2.5;
 }
 
+// 6. Son 3 mumda momentum teyidi
+function isMomentumOk(candles, direction, n) {
+if (n < 3) return false;
+var last3 = candles.slice(n-2, n+1);
+if (direction === “long”) {
+// Son 3 mumun en az 2’si yesil
+var greenCount = last3.filter(function(c) { return c.close > c.open; }).length;
+return greenCount >= 2;
+} else {
+// Son 3 mumun en az 2’si kirmizi
+var redCount = last3.filter(function(c) { return c.close < c.open; }).length;
+return redCount >= 2;
+}
+}
+
+// 7. Funding rate
 function isFundingOk(funding, direction) {
 if (funding === null) return true;
-if (direction === “long”)  return funding < 0.001;
+if (direction === “long”)  return funding < 0.0008;
 if (direction === “short”) return funding > 0.0001;
 return true;
 }
 
-// ─── SR SEVIYELERI ───────────────────────────────────────────
+// 8. ATR aktif piyasa (duz market’te sinyal verme)
+function isATRActive(candles, n) {
+var atr    = calcATR(candles, 14);
+var atrVal = atr[n];
+var atrMA  = avg(atr, 20);
+return atrVal > atrMA * 0.9;
+}
 
-function findSwings(candles, lookback) {
-lookback = lookback || 5;
-var n = candles.length;
-var highs = [], lows = [];
-for (var i = lookback; i < n - lookback; i++) {
-var isHigh = true, isLow = true;
-for (var j = i - lookback; j <= i + lookback; j++) {
-if (j === i) continue;
-if (candles[j].high >= candles[i].high) isHigh = false;
-if (candles[j].low  <= candles[i].low)  isLow  = false;
+// ─── SL/TP HESAPLAMA ─────────────────────────────────────────
+
+function calcSL(price, vwap, atr, direction) {
+if (direction === “long”) {
+// VWAP altina %0.4 + ATR buffer
+var slVWAP = vwap * 0.996;
+var slATR  = price - atr * 1.0;
+return Math.min(slVWAP, slATR);
+} else {
+var slVWAP = vwap * 1.004;
+var slATR  = price + atr * 1.0;
+return Math.max(slVWAP, slATR);
 }
-if (isHigh) highs.push(candles[i].high);
-if (isLow)  lows.push(candles[i].low);
-}
-return { highs: highs, lows: lows };
 }
 
 function calcTP(price, atr, direction) {
 if (direction === “long”) {
-return {
-tp1: price + atr * 1.5,
-tp2: price + atr * 3.0,
-tp3: price + atr * 5.0
-};
+return { tp1: price + atr * 2.0, tp2: price + atr * 3.5, tp3: price + atr * 5.5 };
 } else {
-return {
-tp1: price - atr * 1.5,
-tp2: price - atr * 3.0,
-tp3: price - atr * 5.0
-};
-}
-}
-
-function calcSL(price, vwap, atr, direction) {
-if (direction === “long”) {
-// VWAP altina SL, ama en az ATR x0.5 uzakta
-var slVWAP = vwap * 0.997;
-var slATR  = price - atr * 0.8;
-return Math.min(slVWAP, slATR);
-} else {
-var slVWAP = vwap * 1.003;
-var slATR  = price + atr * 0.8;
-return Math.max(slVWAP, slATR);
+return { tp1: price - atr * 2.0, tp2: price - atr * 3.5, tp3: price - atr * 5.5 };
 }
 }
 
@@ -274,29 +323,28 @@ if (p < 10000)  return p.toFixed(2);
 return p.toFixed(1);
 }
 
-function buildMessage(symbol, direction, price, sl, tps, funding, score, hits) {
+function buildMessage(symbol, direction, price, sl, tps, funding, score, hits, signalNo) {
 var emoji = direction === “long” ? “🟢” : “🔴”;
 var dirTr = direction === “long” ? “LONG  ▲” : “SHORT ▼”;
 var lev   = 20;
 
-var slPct   = (Math.abs(price - sl) / price * 100).toFixed(2);
-var tp1Pct  = (Math.abs(tps.tp1 - price) / price * 100).toFixed(2);
-var tp2Pct  = (Math.abs(tps.tp2 - price) / price * 100).toFixed(2);
-var tp3Pct  = (Math.abs(tps.tp3 - price) / price * 100).toFixed(2);
-var rr      = (parseFloat(tp2Pct) / parseFloat(slPct)).toFixed(1);
+var slPct  = (Math.abs(price - sl)    / price * 100).toFixed(2);
+var tp1Pct = (Math.abs(tps.tp1-price) / price * 100).toFixed(2);
+var tp2Pct = (Math.abs(tps.tp2-price) / price * 100).toFixed(2);
+var tp3Pct = (Math.abs(tps.tp3-price) / price * 100).toFixed(2);
+var rr     = (parseFloat(tp2Pct) / parseFloat(slPct)).toFixed(1);
+
+var sl20   = (parseFloat(slPct)  * lev).toFixed(0);
+var tp120  = (parseFloat(tp1Pct) * lev).toFixed(0);
+var tp220  = (parseFloat(tp2Pct) * lev).toFixed(0);
+var tp320  = (parseFloat(tp3Pct) * lev).toFixed(0);
 
 var fundStr = funding !== null ? (funding * 100).toFixed(4) + “%” : “-”;
 var now     = new Date().toUTCString().slice(5, 25) + “ UTC”;
-var bar     = “█”.repeat(score) + “░”.repeat(5 - score);
-var tier    = score === 5 ? “🔥 MUKEMMEL” : score === 4 ? “⭐ GUCLU” : “✅ IYI”;
+var bar     = “█”.repeat(score) + “░”.repeat(7 - score);
+var tier    = score >= 7 ? “🔥 MUKEMMEL” : score === 6 ? “⭐ GUCLU” : “✅ IYI”;
 
-// 20x kar/zarar
-var sl20  = (parseFloat(slPct)  * lev).toFixed(0);
-var tp120 = (parseFloat(tp1Pct) * lev).toFixed(0);
-var tp220 = (parseFloat(tp2Pct) * lev).toFixed(0);
-var tp320 = (parseFloat(tp3Pct) * lev).toFixed(0);
-
-return emoji + “ <b>” + dirTr + “ — “ + symbol + “</b>\n” +
+return emoji + “ <b>” + dirTr + “ — “ + symbol + “</b>  [Sinyal “ + signalNo + “/2]\n” +
 “━━━━━━━━━━━━━━━━━━━━━━\n” +
 “💰 <b>Giris:</b> “ + fmtPrice(price) + “\n\n” +
 “🎯 <b>TP1:</b> “ + fmtPrice(tps.tp1) + “  (+” + tp1Pct + “% | 20x:+%” + tp120 + “) <i>%40 kapat</i>\n” +
@@ -304,17 +352,17 @@ return emoji + “ <b>” + dirTr + “ — “ + symbol + “</b>\n” +
 “🎯 <b>TP3:</b> “ + fmtPrice(tps.tp3) + “  (+” + tp3Pct + “% | 20x:+%” + tp320 + “) <i>%20 beklet</i>\n” +
 “🛑 <b>SL:</b>  “ + fmtPrice(sl) + “  (-” + slPct + “% | 20x:-%” + sl20 + “)\n” +
 “━━━━━━━━━━━━━━━━━━━━━━\n” +
-“📊 Skor: “ + bar + “ <b>” + score + “/5</b>  “ + tier + “\n” +
+“📊 Skor: “ + bar + “ <b>” + score + “/7</b>  “ + tier + “\n” +
 “✅ <code>” + hits.join(” “) + “</code>\n” +
 “⚖️ R:R: 1:” + rr + “ | 💸 Funding: “ + fundStr + “\n” +
 “━━━━━━━━━━━━━━━━━━━━━━\n” +
-“📌 Strateji: VWAP Bounce\n” +
-“📌 SL: VWAP altı/üstü\n” +
-“📌 TP: ATR bazlı\n” +
+“📌 VWAP Bounce | London Session\n” +
 “━━━━━━━━━━━━━━━━━━━━━━\n” +
-“💡 <i>Mum KAPANISINI bekle sonra gir!\n” +
-“TP1’de %40 kapat, SL’i girise cek.\n” +
-“$100 kazaninca O GUN DUR!</i>\n” +
+“⚠️ <b>KURALLAR:</b>\n” +
+“💡 Mum KAPANISINI bekle, sonra gir!\n” +
+“💡 TP1’de %40 kapat, SL’i girise cek!\n” +
+“💡 $100 kazaninca O GUN DUR!\n” +
+“💡 Stop olursa bugun BITTI!\n” +
 “🕒 “ + now + “\n” +
 “<i>⚠ Ticaret tavsiyesi degildir.</i>”;
 }
@@ -323,12 +371,15 @@ return emoji + “ <b>” + dirTr + “ — “ + symbol + “</b>\n” +
 
 async function scanCoin(symbol) {
 try {
+if (!isSessionOk()) return;
+if (!canSendSignal()) return;
+
+```
 var ticker = await fetchTicker(symbol);
 if (!ticker) return;
 var price = parseFloat(ticker.price || 0);
 if (price <= 0) return;
 
-```
 var results = await Promise.all([
   fetchCandles(symbol, "1h",  100),
   fetchCandles(symbol, "15m", 100),
@@ -351,32 +402,42 @@ for (var d = 0; d < 2; d++) {
   var key = symbol + "_" + direction;
   if (Date.now() - (lastSignal[key] || 0) < COOLDOWN_MS) continue;
 
-  // 1. VWAP Bounce ana kosul
+  // Gunluk limit kontrol
+  if (!canSendSignal()) break;
+
+  // ── ZORUNLU FILTRELER ─────────────────────────────────
+  // Hepsi saglanmali, biri eksik = sinyal yok
+
+  // 1. Session kontrolu
+  if (!isSessionOk()) continue;
+
+  // 2. VWAP Bounce (cok siki)
   if (!isVWAPBounce(c15m, vwap15, direction, n15)) continue;
 
-  // 2. 1h trend teyidi
-  if (!isTrend1h(c1h, direction)) continue;
+  // 3. 1h Guclu trend (EMA9>21>50 + Supertrend)
+  if (!isStrongTrend1h(c1h, direction)) continue;
 
-  var score = 2; // VWAP bounce + trend = 2 puan
-  var hits  = ["VWAP-BOUNCE", "TREND"];
+  // 4. RSI siki bant + donus
+  if (!isRSIStrong(c15m, direction, n15)) continue;
 
-  // 3. RSI
-  if (isRSIOk(c15m, direction, n15)) { score++; hits.push("RSI"); }
+  // 5. CVD zorunlu
+  if (!isCVDConfirm(c15m, direction, n15)) continue;
 
-  // 4. CVD
-  if (isCVDOk(c15m, direction, n15)) { score++; hits.push("CVD"); }
+  // 6. Yuksek hacim (×2.5)
+  if (!isHighVolume(c15m, n15)) continue;
 
-  // 5. Hacim
-  if (isVolumeOk(c15m, n15)) { score++; hits.push("VOL"); }
+  // 7. ATR aktif piyasa
+  if (!isATRActive(c15m, n15)) continue;
 
-  // Funding bonus
-  var fundOk = isFundingOk(funding, direction);
-  if (fundOk) hits.push("FUND");
+  // Tum zorunlu filtreler gecti - skoru hesapla
+  var score = 5; // 5 zorunlu filtre
+  var hits  = ["VWAP", "TREND", "RSI", "CVD", "VOL"];
 
-  // Min 3/5 skor gerekli (VWAP+TREND zorunlu + en az 1 teyit)
-  if (score < 3) continue;
+  // Bonus filtreler
+  if (isMomentumOk(c15m, direction, n15)) { score++; hits.push("MOM"); }
+  if (isFundingOk(funding, direction))     { score++; hits.push("FUND"); }
 
-  // SL ve TP hesapla
+  // SL ve TP
   var sl  = calcSL(price, vwap15[n15], atrVal, direction);
   var tps = calcTP(price, atrVal, direction);
 
@@ -385,16 +446,25 @@ for (var d = 0; d < 2; d++) {
   if (direction === "short" && sl <= price) continue;
 
   var slDist = Math.abs(price - sl) / price;
-  if (slDist > 0.05) continue;
-  if (slDist < 0.001) continue;
+  if (slDist > 0.04) continue;
+  if (slDist < 0.002) continue;
 
-  // R:R min 1:1.5
+  // R:R minimum 1:2
   var rr = Math.abs(tps.tp1 - price) / Math.abs(price - sl);
-  if (rr < 1.5) continue;
+  if (rr < 2.0) continue;
 
-  console.log("🚀 VWAP BOUNCE " + symbol + " " + direction.toUpperCase() + " " + score + "/5 " + hits.join(" "));
-  await sendTelegram(buildMessage(symbol, direction, price, sl, tps, funding, score, hits));
+  // Sinyal gonder
+  dailyState.signalCount++;
   lastSignal[key] = Date.now();
+
+  console.log("🚀 SINYAL #" + dailyState.signalCount + " " + symbol + " " + direction.toUpperCase() + " " + score + "/7");
+  await sendTelegram(buildMessage(symbol, direction, price, sl, tps, funding, score, hits, dailyState.signalCount));
+
+  // Max 2 sinyale ulastik mi?
+  if (dailyState.signalCount >= dailyState.maxSignals) {
+    await sendTelegram("🔒 <b>Gunluk sinyal limiti doldu!</b>\nBugun " + dailyState.maxSignals + " sinyal gonderildi.\nYarin tekrar aktif olacak.\n\n<i>Disiplin = Kar</i>");
+    return;
+  }
 }
 ```
 
@@ -404,33 +474,59 @@ for (var d = 0; d < 2; d++) {
 function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
 
 async function main() {
-console.log(”=”.repeat(55));
-console.log(”  VWAP Bounce Scanner v5”);
-console.log(”  Strateji: VWAP Bounce - Kurumsal Seviye”);
-console.log(”  Coinler: Top 10 Hacimli”);
-console.log(”  TF: 1h trend + 15m giris”);
-console.log(”  SL: VWAP altı/ustu | TP: ATR bazli”);
-console.log(”=”.repeat(55));
+console.log(”=”.repeat(58));
+console.log(”  Profesyonel VWAP Bounce Scanner v6”);
+console.log(”  Session: 10:00-16:00 UTC (13:00-19:00 TR)”);
+console.log(”  Gunluk max 2 sinyal | Stop olursa o gun biter”);
+console.log(”  Filtreler: VWAP+TREND+RSI+CVD+VOL+MOM+FUND”);
+console.log(”  R:R minimum 1:2”);
+console.log(”=”.repeat(58));
 
 await sendTelegram(
-“🤖 <b>VWAP Bounce Scanner v5 aktif</b>\n” +
-“Strateji: VWAP Bounce\n” +
-“Coinler: BTC ETH BNB SOL XRP DOGE ADA AVAX LINK TON\n” +
-“TF: 1h trend + 15m bounce\n” +
-“Gunluk $100 kazaninca DUR!”
+“🤖 <b>Profesyonel VWAP Bounce Scanner v6</b>\n\n” +
+“Session: 13:00-19:00 TR\n” +
+“Gunluk max 2 sinyal\n” +
+“Stop olursa o gun biter\n” +
+“R:R min 1:2\n\n” +
+“Filtreler:\n” +
+“VWAP Bounce (cok siki)\n” +
+“1h EMA9>21>50 + Supertrend\n” +
+“RSI bounce teyidi\n” +
+“CVD zorunlu\n” +
+“Hacim x2.5 zorunlu\n” +
+“Momentum teyidi\n\n” +
+“<i>Az ama kaliteli sinyal!</i>”
 );
 
 var cycle = 0;
 while (true) {
 cycle++;
 var t0 = Date.now();
-console.log(”\n— Tur #” + cycle + “ | “ + new Date().toUTCString() + “ —”);
 
 ```
+resetDailyIfNeeded();
+
+if (!isSessionOk()) {
+  var hour = new Date().getUTCHours();
+  if (cycle % 10 === 0) {
+    console.log("Session disi (" + hour + " UTC) | Bekleniyor...");
+  }
+  await sleep(SCAN_INTERVAL_MS);
+  continue;
+}
+
+if (!canSendSignal()) {
+  await sleep(SCAN_INTERVAL_MS);
+  continue;
+}
+
+console.log("\n--- Tur #" + cycle + " | " + new Date().toUTCString() + " ---");
+console.log("Sinyal: " + dailyState.signalCount + "/" + dailyState.maxSignals + " | Zarar: " + dailyState.hasLoss);
+
 await Promise.all(WATCHLIST.map(function(s) { return scanCoin(s); }));
 
 var elapsed = Date.now() - t0;
-console.log("--- Tur #" + cycle + " bitti (" + (elapsed/1000).toFixed(1) + "s) ---");
+console.log("--- Tur bitti (" + (elapsed/1000).toFixed(1) + "s) ---");
 
 var wait = Math.max(0, SCAN_INTERVAL_MS - elapsed);
 if (wait) await sleep(wait);
