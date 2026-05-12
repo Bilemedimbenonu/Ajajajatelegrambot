@@ -87,8 +87,8 @@ function calcEMA(closes, period) { return pad(ti.EMA.calculate({ period: period,
 function calcRSI(closes, period) { return pad(ti.RSI.calculate({ period: period, values: closes }), closes.length); }
 function calcATR(candles, period) {
 return pad(ti.ATR.calculate({
-high: candles.map(function(c) { return c.high; }),
-low: candles.map(function(c) { return c.low; }),
+high:  candles.map(function(c) { return c.high; }),
+low:   candles.map(function(c) { return c.low; }),
 close: candles.map(function(c) { return c.close; }),
 period: period || 14
 }), candles.length);
@@ -133,16 +133,14 @@ if (!vals.length) return 0;
 return vals.reduce(function(a, b) { return a + b; }, 0) / vals.length;
 }
 
-// ─── FILTRELER ───────────────────────────────────────────────
-
-// VWAP Bounce - biraz gevsetildi (%0.5)
+// VWAP Bounce - %0.5 tolerans
 function isVWAPBounce(candles, vwap, direction, n) {
 if (n < 3) return false;
 var price = candles[n].close;
 var vwapN = vwap[n];
 if (!vwapN) return false;
 var dist = Math.abs(price - vwapN) / vwapN;
-if (dist > 0.005) return false; // %0.5
+if (dist > 0.005) return false;
 var prev = candles[n-1], curr = candles[n];
 if (direction === “long”) {
 var touchedVWAP = prev.low <= vwapN * 1.003;
@@ -186,14 +184,14 @@ if (direction === “short”) return r >= 42 && r <= 72;
 return false;
 }
 
-// CVD - bonus (zorunlu degil)
+// CVD - bonus
 function isCVDOk(candles, direction, n) {
 var cvd   = calcCVD(candles);
 var cvdUp = cvd[n] > cvd[n-3];
 return direction === “long” ? cvdUp : !cvdUp;
 }
 
-// Hacim - gevsetildi x1.8
+// Hacim - x1.8
 function isVolumeOk(candles, n) {
 var vols   = candles.map(function(c) { return c.vol; });
 var volAvg = avg(vols, 20);
@@ -216,8 +214,7 @@ if (direction === “short”) return funding > 0.0001;
 return true;
 }
 
-// ─── SL/TP ───────────────────────────────────────────────────
-
+// SL/TP
 function calcSL(price, vwap, atr, direction) {
 if (direction === “long”) {
 var slVWAP = vwap * 0.996;
@@ -237,8 +234,6 @@ return { tp1: price + atr * 2.0, tp2: price + atr * 3.5, tp3: price + atr * 5.5 
 return { tp1: price - atr * 2.0, tp2: price - atr * 3.5, tp3: price - atr * 5.5 };
 }
 }
-
-// ─── TELEGRAM ────────────────────────────────────────────────
 
 async function sendTelegram(text) {
 if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
@@ -298,8 +293,6 @@ return emoji + “ <b>” + dirTr + “ — “ + symbol + “</b>  [” + signa
 “<i>⚠ Ticaret tavsiyesi degildir.</i>”;
 }
 
-// ─── TARAMA ──────────────────────────────────────────────────
-
 async function scanCoin(symbol) {
 try {
 if (!isSessionOk() || !canSendSignal()) return;
@@ -330,29 +323,20 @@ for (var d = 0; d < 2; d++) {
   if (Date.now() - (lastSignal[key] || 0) < COOLDOWN_MS) continue;
   if (!canSendSignal()) break;
 
-  // ZORUNLU: VWAP Bounce
   if (!isVWAPBounce(c15m, vwap15, direction, n15)) continue;
-
-  // ZORUNLU: 1h trend
   if (!isStrongTrend1h(c1h, direction)) continue;
-
-  // ZORUNLU: RSI bant
   if (!isRSIOk(c15m, direction, n15)) continue;
 
-  // Skor sistemi
-  var score = 3; // 3 zorunlu filtre
+  var score = 3;
   var hits  = ["VWAP", "TREND", "RSI"];
 
-  // Bonus filtreler
-  if (isVolumeOk(c15m, n15))          { score++; hits.push("VOL"); }
-  if (isCVDOk(c15m, direction, n15))  { score++; hits.push("CVD"); }
+  if (isVolumeOk(c15m, n15))              { score++; hits.push("VOL"); }
+  if (isCVDOk(c15m, direction, n15))      { score++; hits.push("CVD"); }
   if (isMomentumOk(c15m, direction, n15)) { score++; hits.push("MOM"); }
-  if (isFundingOk(funding, direction)) { hits.push("FUND"); }
+  if (isFundingOk(funding, direction))     { hits.push("FUND"); }
 
-  // Min 4/6 skor
   if (score < 4) continue;
 
-  // SL/TP
   var sl  = calcSL(price, vwap15[n15], atrVal, direction);
   var tps = calcTP(price, atrVal, direction);
 
@@ -362,7 +346,6 @@ for (var d = 0; d < 2; d++) {
   var slDist = Math.abs(price - sl) / price;
   if (slDist > 0.05 || slDist < 0.002) continue;
 
-  // R:R min 1:1.5
   var rr = Math.abs(tps.tp1 - price) / Math.abs(price - sl);
   if (rr < 1.5) continue;
 
@@ -397,7 +380,7 @@ await sendTelegram(
 “Session: 13:00-19:00 TR\n” +
 “Gunluk max 2 sinyal\n” +
 “Min skor: 4/6\n” +
-“Filtreler biraz gevsetildi\n\n” +
+“Filtreler gevsetildi\n\n” +
 “<i>Az ama kaliteli sinyal!</i>”
 );
 
@@ -420,9 +403,8 @@ if (!canSendSignal()) {
 }
 
 console.log("Tur #" + cycle + " | " + new Date().toUTCString() + " | Sinyal: " + dailyState.signalCount + "/2");
-await Promise.all(WATCHLIST.map(function(s) { return scanCoin(s); }));
-
 var t0 = Date.now();
+await Promise.all(WATCHLIST.map(function(s) { return scanCoin(s); }));
 await sleep(Math.max(0, SCAN_INTERVAL_MS - (Date.now() - t0)));
 ```
 
