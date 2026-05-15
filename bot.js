@@ -48,7 +48,7 @@ return true;
 
 function isSessionOk() {
 var hour = new Date().getUTCHours();
-return hour >= 10 && hour < 16;
+return hour >= 10 && hour < 20;
 }
 
 const lastSignal = {};
