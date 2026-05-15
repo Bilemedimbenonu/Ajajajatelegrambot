@@ -48,7 +48,7 @@ return true;
 
 function isSessionOk() {
 var hour = new Date().getUTCHours();
-return hour >= 10 && hour < 20;
+return hour >= 10 && hour < 20; // London + New York (13:00-23:00 TR)
 }
 
 const lastSignal = {};
@@ -376,15 +376,15 @@ function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
 async function main() {
 console.log(”=”.repeat(55));
 console.log(”  VWAP Bounce Scanner v6.1”);
-console.log(”  Session: 10:00-16:00 UTC (13:00-19:00 TR)”);
+console.log(”  Session: 10:00-20:00 UTC (13:00-23:00 TR)”);
 console.log(”  Gunluk max 2 sinyal”);
 console.log(”  Min skor: 4/6”);
 console.log(”=”.repeat(55));
 
 await sendTelegram(
 “🤖 <b>VWAP Bounce Scanner v6.1</b>\n\n” +
-“Session: 13:00-19:00 TR\n” +
-“Gunluk max 2 sinyal\n” +
+“Session: 13:00-23:00 TR (London+NY)\n” +
+“40 coin taraniyor\n” +
 “Min skor: 4/6\n” +
 “Filtreler gevsetildi\n\n” +
 “<i>Az ama kaliteli sinyal!</i>”
