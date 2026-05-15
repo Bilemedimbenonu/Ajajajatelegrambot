@@ -11,7 +11,13 @@ const COOLDOWN_MS      = 1800000;
 
 const WATCHLIST = [
 “BTCUSDT”, “ETHUSDT”, “BNBUSDT”, “SOLUSDT”, “XRPUSDT”,
-“DOGEUSDT”, “ADAUSDT”, “AVAXUSDT”, “LINKUSDT”, “TONUSDT”
+“DOGEUSDT”, “ADAUSDT”, “AVAXUSDT”, “LINKUSDT”, “TONUSDT”,
+“DOTUSDT”, “MATICUSDT”, “LTCUSDT”, “NEARUSDT”, “ATOMUSDT”,
+“APTUSDT”, “ARBUSDT”, “OPUSDT”, “INJUSDT”, “SUIUSDT”,
+“SEIUSDT”, “TIAUSDT”, “FETUSDT”, “WLDUSDT”, “RUNEUSDT”,
+“FILUSDT”, “AAVEUSDT”, “UNIUSDT”, “MKRUSDT”, “SNXUSDT”,
+“CRVUSDT”, “LDOUSDT”, “STXUSDT”, “ALGOUSDT”, “ICPUSDT”,
+“FLOWUSDT”, “EGLDUSDT”, “SANDUSDT”, “MANAUSDT”, “AXSUSDT”
 ];
 
 var dailyState = {
@@ -140,7 +146,7 @@ var price = candles[n].close;
 var vwapN = vwap[n];
 if (!vwapN) return false;
 var dist = Math.abs(price - vwapN) / vwapN;
-if (dist > 0.005) return false;
+if (dist > 0.008) return false;
 var prev = candles[n-1], curr = candles[n];
 if (direction === “long”) {
 var touchedVWAP = prev.low <= vwapN * 1.003;
@@ -148,7 +154,7 @@ var greenCandle = curr.close > curr.open;
 var aboveVWAP   = curr.close > vwapN;
 var body        = Math.abs(curr.close - curr.open);
 var lowerWick   = Math.min(curr.open, curr.close) - curr.low;
-var hasWick     = body > 0 && lowerWick >= body * 0.3;
+var hasWick     = body > 0 && lowerWick >= body * 0.2;
 return touchedVWAP && greenCandle && aboveVWAP && hasWick;
 } else {
 var touchedVWAP = prev.high >= vwapN * 0.997;
@@ -156,7 +162,7 @@ var redCandle   = curr.close < curr.open;
 var belowVWAP   = curr.close < vwapN;
 var body        = Math.abs(curr.close - curr.open);
 var upperWick   = curr.high - Math.max(curr.open, curr.close);
-var hasWick     = body > 0 && upperWick >= body * 0.3;
+var hasWick     = body > 0 && upperWick >= body * 0.2;
 return touchedVWAP && redCandle && belowVWAP && hasWick;
 }
 }
