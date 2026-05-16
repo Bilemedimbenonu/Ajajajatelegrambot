@@ -17,7 +17,7 @@ MACD_15M:    true,   // 15m MACD crossover
 RSI:         true,   // RSI bant filtresi
 VOLUME:      true,   // Hacim spike
 CVD:         true,   // Cumulative Volume Delta
-LEVEL_4H:    true,   // 4h high/low kirilimu
+BB:          true,   // Bollinger Band sikismasi + kirilim
 BTC_FILTER:  true,   // BTC trend filtresi
 FUNDING:     true,   // Funding rate filtresi
 };
@@ -147,6 +147,12 @@ signalPeriod: 9, SimpleMAOscillator: false, SimpleMASignal: false
 return pad(result, closes.length);
 }
 
+function calcBB(closes, period, stdDev) {
+period = period || 20; stdDev = stdDev || 2;
+var result = ti.BollingerBands.calculate({ period: period, values: closes, stdDev: stdDev });
+return pad(result, closes.length);
+}
+
 function calcSupertrend(candles, period, mult) {
 period = period || 10; mult = mult || 3.0;
 var atr = calcATR(candles, period);
@@ -240,14 +246,24 @@ var cvdUp = cvd[n] > cvd[n-3];
 return direction === “long” ? cvdUp : !cvdUp;
 }
 
-function checkLevel4h(c4h, price, direction) {
-var n    = c4h.length - 1;
-var highs = c4h.slice(n-20, n).map(function(c) { return c.high; });
-var lows  = c4h.slice(n-20, n).map(function(c) { return c.low; });
-var high  = Math.max.apply(null, highs);
-var low   = Math.min.apply(null, lows);
-if (direction === “long”)  return price > high * 0.998;
-if (direction === “short”) return price < low  * 1.002;
+// BB Sikismasi + Kirilim
+function checkBB(c15m, direction) {
+var closes = c15m.map(function(c) { return c.close; });
+var bb     = calcBB(closes, 20, 2);
+var n      = c15m.length - 1;
+var curr   = bb[n];
+var prev   = bb[n-5]; // 5 mum oncesi band genisligi
+if (!curr || !prev) return false;
+
+var currWidth = curr.upper - curr.lower;
+var prevWidth = prev.upper - prev.lower;
+var price     = closes[n];
+
+// Band daralip tekrar genisliyor mu (sikisma sonrasi kirilim)
+var wasSqueezed = currWidth > prevWidth * 0.8;
+// Fiyat hangi yone kiriliyor
+if (direction === “long”)  return wasSqueezed && price > curr.middle;
+if (direction === “short”) return wasSqueezed && price < curr.middle;
 return false;
 }
 
@@ -354,13 +370,12 @@ if (!price || price <= 0) return;
 var results = await Promise.all([
   fetchCandles(symbol, "1h",  100),
   fetchCandles(symbol, "15m", 100),
-  fetchCandles(symbol, "4h",  50),
   fetchFunding(symbol)
 ]);
 
-var c1h = results[0], c15m = results[1], c4h = results[2], funding = results[3];
-if (!c1h || !c15m || !c4h) return;
-if (c1h.length < 30 || c15m.length < 30 || c4h.length < 25) return;
+var c1h = results[0], c15m = results[1], funding = results[2];
+if (!c1h || !c15m) return;
+if (c1h.length < 30 || c15m.length < 30) return;
 
 var atr15  = calcATR(c15m, 14);
 var atrVal = atr15[c15m.length - 1] || price * 0.005;
