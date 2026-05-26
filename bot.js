@@ -70,7 +70,7 @@ async function tgSend(text) {
 }
 
 var lastSignal = {};
-var COOLDOWN = 14400000; // 4 saat
+var COOLDOWN = 0;
 
 async function scanSymbol(sym) {
   try {
@@ -90,62 +90,46 @@ async function scanSymbol(sym) {
     const n15 = c15m.length - 1;
     const price = c5m[n5].close;
 
-    // ATR hesapla
     const atr5 = calcATR(c5m, 14);
     const atrVal = atr5[n5];
 
-    // OBV hesapla - 5m ve 15m
     const obv5 = calcOBV(c5m);
     const obv15 = calcOBV(c15m);
 
-    // OBV EMA - trend yonu
     const obvEma5 = calcEMA(obv5, 20);
     const obvEma15 = calcEMA(obv15, 20);
 
-    // 5m OBV trendi
     const obv5Bull = obv5[n5] > obvEma5[n5] && obv5[n5] > obv5[n5-3];
     const obv5Bear = obv5[n5] < obvEma5[n5] && obv5[n5] < obv5[n5-3];
 
-    // 15m OBV trendi
     const obv15Bull = obv15[n15] > obvEma15[n15] && obv15[n15] > obv15[n15-3];
     const obv15Bear = obv15[n15] < obvEma15[n15] && obv15[n15] < obv15[n15-3];
 
-    // OBV divergence - fiyat yeni low ama OBV yapmadi (bullish)
     const price5Low = Math.min(...c5m.slice(-10).map(c => c.low));
     const obvLow = Math.min(...obv5.slice(-10));
     const bullDiv = c5m[n5].low <= price5Low && obv5[n5] > obvLow * 1.02;
 
-    // OBV divergence - fiyat yeni high ama OBV yapmadi (bearish)
     const price5High = Math.max(...c5m.slice(-10).map(c => c.high));
     const obvHigh = Math.max(...obv5.slice(-10));
     const bearDiv = c5m[n5].high >= price5High && obv5[n5] < obvHigh * 0.98;
 
-    // Funding rate kontrolu
-    const fundingOk = funding !== null;
     const fundingExtremeLong = funding > 0.0005;
     const fundingExtremeShort = funding < -0.0005;
 
-    // Mum body kontrolu
     const lastCandle = c5m[n5];
     const body = Math.abs(lastCandle.close - lastCandle.open);
     const totalRange = lastCandle.high - lastCandle.low;
     if (totalRange > 0 && body / totalRange < 0.4) return;
 
-    // Sinyal mantigi
     let direction = null;
-
-    // LONG: 5m ve 15m OBV yukari + bullish divergence veya funding extreme short
     if (obv5Bull && obv15Bull && (bullDiv || fundingExtremeShort)) {
       direction = "long";
-    }
-    // SHORT: 5m ve 15m OBV asagi + bearish divergence veya funding extreme long
-    else if (obv5Bear && obv15Bear && (bearDiv || fundingExtremeLong)) {
+    } else if (obv5Bear && obv15Bear && (bearDiv || fundingExtremeLong)) {
       direction = "short";
     }
 
     if (!direction) return;
 
-    // SL ve TP hesapla
     let sl, tp1, tp2, tp3;
     if (direction === "long") {
       sl = price - atrVal * 1.5;
@@ -159,7 +143,6 @@ async function scanSymbol(sym) {
       tp3 = price - atrVal * 5.0;
     }
 
-    // RR kontrolu
     const slDist = Math.abs(price - sl) / price;
     if (slDist > 0.05 || slDist < 0.002) return;
     const rr = Math.abs(tp2 - price) / Math.abs(price - sl);
@@ -180,25 +163,65 @@ async function scanSymbol(sym) {
     const msg =
       "<b>" + label + " " + sym + "</b>\n" +
       "--------\n" +
-      "<b>Giris:</b> " + fmtPrice(price) + "\n\n" +
+      "<b>Giris:</b> " + fmtPrice(price) + "\n" +
+      "<b>OBV Sinyal:</b> " + divStr + "\n\n" +
       "<b>TP1:</b> " + fmtPrice(tp1) + " (+" + tp1Pct + "% | " + lev + "x:+%" + (parseFloat(tp1Pct)*lev).toFixed(0) + ") %30\n" +
       "<b>TP2:</b> " + fmtPrice(tp2) + " (+" + tp2Pct + "% | " + lev + "x:+%" + (parseFloat(tp2Pct)*lev).toFixed(0) + ") %40\n" +
       "<b>TP3:</b> " + fmtPrice(tp3) + " (+" + tp3Pct + "% | " + lev + "x:+%" + (parseFloat(tp3Pct)*lev).toFixed(0) + ") %30\n" +
       "<b>SL:</b> " + fmtPrice(sl) + " (-" + slPct + "% | " + lev + "x:-%" + (parseFloat(slPct)*lev).toFixed(0) + ")\n" +
       "--------\n" +
-      "OBV: " + divStr + " | R:R: 1:" + rrStr + " | Funding: " + fund + "\n" +
+      "R:R: 1:" + rrStr + " | Funding: " + fund + "\n" +
       "--------\n" +
-      "<b>SMC OBV Bot v1.0</b>\n" +
+      "<b>OBV Bot v1.0 | BTC+ETH</b>\n" +
       "Strateji: OBV Divergence + Funding\n" +
-      "Sembol: BTC + ETH | 5m+15m\n" +
       "--------\n" +
-      "<i>TP1'de %30 kapat, SL'yi girişe çek!\i>\n" +
-      "<i>TP2'de %40 kapat, kalanını sürdür!</i>\n" +
+      "<i>TP1 gelince SL girise cek!</i>\n" +
+      "<i>TP3 hedefliyorsan pozisyonu koru!</i>\n" +
       new Date().toUTCString().slice(5, 25) + " UTC\n" +
-      "<i>Ticaret tavsiyesi değildir.</i>";
+      "<i>Ticaret tavsiyesi degildir.</i>";
 
     console.log("[SINYAL] " + sym + " " + direction.toUpperCase());
     await tgSend(msg);
+
+    var tpHit = { tp1: false, tp2: false, sl: false };
+    var trackInterval = setInterval(async function() {
+      try {
+        var d = await bGet("/fapi/v1/ticker/price", { symbol: sym });
+        if (!d) return;
+        var cur = parseFloat(d.price);
+
+        if (direction === "long") {
+          if (!tpHit.tp1 && cur >= tp1) {
+            tpHit.tp1 = true;
+            await tgSend("🟡 <b>TP1 HIT!</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nSL girise cek! (" + fmtPrice(price) + ")\nTP2/TP3 icin pozisyonu koru.");
+          }
+          if (!tpHit.tp2 && cur >= tp2) {
+            tpHit.tp2 = true;
+            await tgSend("🟢 <b>TP2 HIT!</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nTP3 hedefliyorsan pozisyonu koru!\nHedef: " + fmtPrice(tp3));
+          }
+          if (!tpHit.sl && cur <= sl) {
+            tpHit.sl = true;
+            await tgSend("🔴 <b>STOP!</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nSL tetiklendi: " + fmtPrice(sl));
+            clearInterval(trackInterval);
+          }
+        } else {
+          if (!tpHit.tp1 && cur <= tp1) {
+            tpHit.tp1 = true;
+            await tgSend("🟡 <b>TP1 HIT!</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nSL girise cek! (" + fmtPrice(price) + ")\nTP2/TP3 icin pozisyonu koru.");
+          }
+          if (!tpHit.tp2 && cur <= tp2) {
+            tpHit.tp2 = true;
+            await tgSend("🟢 <b>TP2 HIT!</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nTP3 hedefliyorsan pozisyonu koru!\nHedef: " + fmtPrice(tp3));
+          }
+          if (!tpHit.sl && cur >= sl) {
+            tpHit.sl = true;
+            await tgSend("🔴 <b>STOP!</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nSL tetiklendi: " + fmtPrice(sl));
+            clearInterval(trackInterval);
+          }
+        }
+        setTimeout(function() { clearInterval(trackInterval); }, 14400000);
+      } catch(e) {}
+    }, 30000);
 
   } catch(e) {
     console.error("[ERR] " + sym + ": " + e.message);
@@ -215,8 +238,8 @@ async function main() {
     "Strateji: OBV Divergence + Funding Rate\n" +
     "Semboller: BTCUSDT + ETHUSDT\n" +
     "Tarama: Her dakika\n" +
-    "Cooldown: 4 saat/sembol\n\n" +
-    "<i>Başladı!</i>"
+    "TP/SL takibi: Otomatik\n\n" +
+    "<i>Basladi!</i>"
   );
 
   while (true) {
