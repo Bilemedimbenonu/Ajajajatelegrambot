@@ -1,13 +1,25 @@
 const axios = require("axios");
+
 const TG_TOKEN = process.env.TG_BOT_TOKEN || "";
-const TG_CHAT = process.env.TG_CHAT_ID || "";
-const BINANCE = "https://fapi.binance.com";
-const SYMBOLS = ["BTCUSDT", "ETHUSDT"];
-const SCAN_MS = 60000;
+const TG_CHAT  = process.env.TG_CHAT_ID  || "";
+const BINANCE  = "https://fapi.binance.com";
+
+const SYMBOLS = [
+  "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+  "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT"
+];
+
+const SCAN_MS  = 60000;
+const COOLDOWN = 30 * 60000;
+const MAX_BARS = 6;
 
 async function bGet(path, params) {
   try {
-    const r = await axios.get(BINANCE + path, { params: params || {}, timeout: 12000, headers: { "User-Agent": "Mozilla/5.0" } });
+    const r = await axios.get(BINANCE + path, {
+      params: params || {},
+      timeout: 12000,
+      headers: { "User-Agent": "Mozilla/5.0" }
+    });
     return r.data;
   } catch(e) { return null; }
 }
@@ -15,7 +27,14 @@ async function bGet(path, params) {
 async function getCandles(sym, tf, limit) {
   const d = await bGet("/fapi/v1/klines", { symbol: sym, interval: tf, limit: limit || 100 });
   if (!d) return null;
-  return d.map(c => ({ open: parseFloat(c[1]), high: parseFloat(c[2]), low: parseFloat(c[3]), close: parseFloat(c[4]), volume: parseFloat(c[5]) }));
+  return d.map(c => ({
+    time: c[0],
+    open: parseFloat(c[1]),
+    high: parseFloat(c[2]),
+    low: parseFloat(c[3]),
+    close: parseFloat(c[4]),
+    volume: parseFloat(c[5])
+  }));
 }
 
 async function getFunding(sym) {
@@ -23,15 +42,30 @@ async function getFunding(sym) {
   return d ? parseFloat(d.lastFundingRate || 0) : null;
 }
 
-function calcOBV(candles) {
-  let obv = 0;
-  const obvArr = [0];
-  for (let i = 1; i < candles.length; i++) {
-    if (candles[i].close > candles[i-1].close) obv += candles[i].volume;
-    else if (candles[i].close < candles[i-1].close) obv -= candles[i].volume;
-    obvArr.push(obv);
+async function getOrderBook(sym) {
+  const d = await bGet("/fapi/v1/depth", { symbol: sym, limit: 20 });
+  if (!d) return null;
+  const bidVol = d.bids.reduce((s, b) => s + parseFloat(b[1]), 0);
+  const askVol = d.asks.reduce((s, a) => s + parseFloat(a[1]), 0);
+  return { bidVol, askVol, ratio: bidVol / askVol };
+}
+
+async function getTakerFlow(sym) {
+  const d = await bGet("/fapi/v1/aggTrades", { symbol: sym, limit: 200 });
+  if (!d) return null;
+  let buyVol = 0, sellVol = 0;
+  for (const t of d) {
+    const qty = parseFloat(t.q);
+    if (t.m) sellVol += qty;
+    else buyVol += qty;
   }
-  return obvArr;
+  const total = buyVol + sellVol;
+  return total > 0 ? { buyVol, sellVol, buyPct: buyVol / total } : null;
+}
+
+async function getOI(sym) {
+  const d = await bGet("/fapi/v1/openInterest", { symbol: sym });
+  return d ? parseFloat(d.openInterest) : null;
 }
 
 function calcEMA(arr, period) {
@@ -56,196 +90,373 @@ function calcATR(candles, period) {
 
 function fmtPrice(p) {
   if (p >= 1000) return p.toFixed(1);
-  if (p >= 100) return p.toFixed(2);
-  if (p >= 1) return p.toFixed(3);
+  if (p >= 100)  return p.toFixed(2);
+  if (p >= 1)    return p.toFixed(3);
   return p.toFixed(5);
+}
+
+function calcEMATrend(candles, fast, slow) {
+  const closes = candles.map(c => c.close);
+  const emaF = calcEMA(closes, fast);
+  const emaS = calcEMA(closes, slow);
+  const i = closes.length - 1;
+  if (emaF[i] > emaS[i]) return "bull";
+  if (emaF[i] < emaS[i]) return "bear";
+  return "neutral";
+}
+
+function getSwingLow(candles)  { return Math.min.apply(null, candles.slice(-5).map(c => c.low));  }
+function getSwingHigh(candles) { return Math.max.apply(null, candles.slice(-5).map(c => c.high)); }
+
+function findStructuralResistance(candles, currentPrice) {
+  const recent = candles.slice(-30);
+  let nearest = null;
+  for (let i = 1; i < recent.length - 1; i++) {
+    if (recent[i].high > recent[i-1].high && recent[i].high > recent[i+1].high) {
+      if (recent[i].high > currentPrice * 1.001) {
+        if (nearest === null || recent[i].high < nearest) {
+          nearest = recent[i].high;
+        }
+      }
+    }
+  }
+  return nearest;
+}
+
+function findStructuralSupport(candles, currentPrice) {
+  const recent = candles.slice(-30);
+  let nearest = null;
+  for (let i = 1; i < recent.length - 1; i++) {
+    if (recent[i].low < recent[i-1].low && recent[i].low < recent[i+1].low) {
+      if (recent[i].low < currentPrice * 0.999) {
+        if (nearest === null || recent[i].low > nearest) {
+          nearest = recent[i].low;
+        }
+      }
+    }
+  }
+  return nearest;
 }
 
 async function tgSend(text) {
   try {
     await axios.post("https://api.telegram.org/bot" + TG_TOKEN + "/sendMessage", {
-      chat_id: TG_CHAT, text: text, parse_mode: "HTML"
+      chat_id: TG_CHAT,
+      text: text,
+      parse_mode: "HTML"
     });
   } catch(e) {}
 }
 
 var lastSignal = {};
-var COOLDOWN = 0;
+var pendingConfirmations = {};
+var btcTrend15m = "neutral";
 
 async function scanSymbol(sym) {
   try {
-    const key = sym;
-    if (Date.now() - (lastSignal[key] || 0) < COOLDOWN) return;
+    if (Date.now() - (lastSignal[sym] || 0) < COOLDOWN) return;
 
-    const [c5m, c15m, funding] = await Promise.all([
+    const [c5m, c15m, funding, ob, taker, oi] = await Promise.all([
       getCandles(sym, "5m", 100),
       getCandles(sym, "15m", 100),
-      getFunding(sym)
+      getFunding(sym),
+      getOrderBook(sym),
+      getTakerFlow(sym),
+      getOI(sym)
     ]);
 
-    if (!c5m || !c15m) return;
+    if (!c5m || !c15m || !ob || !taker) return;
     if (c5m.length < 50 || c15m.length < 50) return;
 
     const n5 = c5m.length - 1;
-    const n15 = c15m.length - 1;
     const price = c5m[n5].close;
+    const lastClosed = c5m[n5 - 1];
+
+    const trend5  = calcEMATrend(c5m,  9, 21);
+    const trend15 = calcEMATrend(c15m, 9, 21);
+    const isBtc   = sym === "BTCUSDT";
+
+    let trendDir = null;
+    if (trend5 === "bull" && trend15 === "bull" && (isBtc || btcTrend15m === "bull")) trendDir = "long";
+    if (trend5 === "bear" && trend15 === "bear" && (isBtc || btcTrend15m === "bear")) trendDir = "short";
+    if (!trendDir) return;
 
     const atr5 = calcATR(c5m, 14);
-    const atrVal = atr5[n5];
+    const atrNow = atr5[n5];
+    const atrAvg = atr5.slice(-50).reduce((a,b) => a+b, 0) / 50;
+    const atrRatio = atrNow / atrAvg;
+    if (atrRatio < 0.6 || atrRatio > 1.5) return;
 
-    const obv5 = calcOBV(c5m);
-    const obv15 = calcOBV(c15m);
+    const body = Math.abs(lastClosed.close - lastClosed.open);
+    const range = lastClosed.high - lastClosed.low;
+    if (range === 0) return;
+    if (body / range < 0.5) return;
 
-    const obvEma5 = calcEMA(obv5, 20);
-    const obvEma15 = calcEMA(obv15, 20);
+    const volAvg = c5m.slice(-20, -1).reduce((s, c) => s + c.volume, 0) / 19;
+    if (lastClosed.volume < volAvg * 1.1) return;
 
-    const obv5Bull = obv5[n5] > obvEma5[n5] && obv5[n5] > obv5[n5-3];
-    const obv5Bear = obv5[n5] < obvEma5[n5] && obv5[n5] < obv5[n5-3];
+    const mumYon = lastClosed.close > lastClosed.open ? "bull" : "bear";
+    if (trendDir === "long"  && mumYon !== "bull") return;
+    if (trendDir === "short" && mumYon !== "bear") return;
 
-    const obv15Bull = obv15[n15] > obvEma15[n15] && obv15[n15] > obv15[n15-3];
-    const obv15Bear = obv15[n15] < obvEma15[n15] && obv15[n15] < obv15[n15-3];
+    const obBullish = ob.ratio > 1.3;
+    const obBearish = ob.ratio < 0.77;
+    const takerBullish = taker.buyPct > 0.55;
+    const takerBearish = taker.buyPct < 0.45;
 
-    const price5Low = Math.min(...c5m.slice(-10).map(c => c.low));
-    const obvLow = Math.min(...obv5.slice(-10));
-    const bullDiv = c5m[n5].low <= price5Low && obv5[n5] > obvLow * 1.02;
+    var oiKey = sym + "_oi";
+    var oiPrev = global[oiKey] || oi;
+    global[oiKey] = oi;
+    const oiUp = oi > oiPrev * 1.001;
+    const oiDown = oi < oiPrev * 0.999;
 
-    const price5High = Math.max(...c5m.slice(-10).map(c => c.high));
-    const obvHigh = Math.max(...obv5.slice(-10));
-    const bearDiv = c5m[n5].high >= price5High && obv5[n5] < obvHigh * 0.98;
+    let orderFlowOk = false;
+    if (trendDir === "long"  && obBullish && takerBullish && (oiUp || oiPrev === oi)) orderFlowOk = true;
+    if (trendDir === "short" && obBearish && takerBearish && (oiDown || oiPrev === oi)) orderFlowOk = true;
+    if (!orderFlowOk) return;
 
-    const fundingExtremeLong = funding > 0.0005;
-    const fundingExtremeShort = funding < -0.0005;
-
-    const lastCandle = c5m[n5];
-    const body = Math.abs(lastCandle.close - lastCandle.open);
-    const totalRange = lastCandle.high - lastCandle.low;
-    if (totalRange > 0 && body / totalRange < 0.4) return;
-
-    let direction = null;
-    if (obv5Bull && obv15Bull && (bullDiv || fundingExtremeShort)) {
-      direction = "long";
-    } else if (obv5Bear && obv15Bear && (bearDiv || fundingExtremeLong)) {
-      direction = "short";
-    }
-
-    if (!direction) return;
-
-    let sl, tp1, tp2, tp3;
-    if (direction === "long") {
-      sl = price - atrVal * 1.5;
-      tp1 = price + atrVal * 1.5;
-      tp2 = price + atrVal * 3.0;
-      tp3 = price + atrVal * 5.0;
+    let tp1Level, slLevel;
+    if (trendDir === "long") {
+      tp1Level = findStructuralResistance(c5m, price);
+      slLevel  = getSwingLow(c5m) - atrNow * 0.2;
+      if (!tp1Level) tp1Level = price + atrNow * 2;
     } else {
-      sl = price + atrVal * 1.5;
-      tp1 = price - atrVal * 1.5;
-      tp2 = price - atrVal * 3.0;
-      tp3 = price - atrVal * 5.0;
+      tp1Level = findStructuralSupport(c5m, price);
+      slLevel  = getSwingHigh(c5m) + atrNow * 0.2;
+      if (!tp1Level) tp1Level = price - atrNow * 2;
     }
 
-    const slDist = Math.abs(price - sl) / price;
-    if (slDist > 0.05 || slDist < 0.002) return;
-    const rr = Math.abs(tp2 - price) / Math.abs(price - sl);
-    if (rr < 1.5) return;
+    const slDist  = Math.abs(price - slLevel);
+    const tp1Dist = Math.abs(tp1Level - price);
+    const rr1 = tp1Dist / slDist;
+    if (rr1 < 1.0) return;
 
-    lastSignal[key] = Date.now();
+    let tp2Level;
+    if (trendDir === "long") {
+      const next = findStructuralResistance(c5m, tp1Level);
+      tp2Level = next || price + slDist * 2.5;
+    } else {
+      const next = findStructuralSupport(c5m, tp1Level);
+      tp2Level = next || price - slDist * 2.5;
+    }
 
-    const lev = 10;
-    const label = direction === "long" ? "[LONG]" : "[SHORT]";
-    const slPct = (slDist * 100).toFixed(2);
-    const tp1Pct = (Math.abs(tp1 - price) / price * 100).toFixed(2);
-    const tp2Pct = (Math.abs(tp2 - price) / price * 100).toFixed(2);
-    const tp3Pct = (Math.abs(tp3 - price) / price * 100).toFixed(2);
-    const fund = funding !== null ? (funding * 100).toFixed(4) + "%" : "-";
-    const rrStr = (Math.abs(tp2 - price) / Math.abs(price - sl)).toFixed(1);
-    const divStr = direction === "long" ? (bullDiv ? "BULL-DIV" : "FUND-EXT") : (bearDiv ? "BEAR-DIV" : "FUND-EXT");
+    let bonusScore = 0;
+    let bonusReasons = [];
 
-    const msg =
-      "<b>" + label + " " + sym + "</b>\n" +
-      "--------\n" +
-      "<b>Giris:</b> " + fmtPrice(price) + "\n" +
-      "<b>OBV Sinyal:</b> " + divStr + "\n\n" +
-      "<b>TP1:</b> " + fmtPrice(tp1) + " (+" + tp1Pct + "% | " + lev + "x:+%" + (parseFloat(tp1Pct)*lev).toFixed(0) + ") %30\n" +
-      "<b>TP2:</b> " + fmtPrice(tp2) + " (+" + tp2Pct + "% | " + lev + "x:+%" + (parseFloat(tp2Pct)*lev).toFixed(0) + ") %40\n" +
-      "<b>TP3:</b> " + fmtPrice(tp3) + " (+" + tp3Pct + "% | " + lev + "x:+%" + (parseFloat(tp3Pct)*lev).toFixed(0) + ") %30\n" +
-      "<b>SL:</b> " + fmtPrice(sl) + " (-" + slPct + "% | " + lev + "x:-%" + (parseFloat(slPct)*lev).toFixed(0) + ")\n" +
-      "--------\n" +
-      "R:R: 1:" + rrStr + " | Funding: " + fund + "\n" +
-      "--------\n" +
-      "<b>OBV Bot v1.0 | BTC+ETH</b>\n" +
-      "Strateji: OBV Divergence + Funding\n" +
-      "--------\n" +
-      "<i>TP1 gelince SL girise cek!</i>\n" +
-      "<i>TP3 hedefliyorsan pozisyonu koru!</i>\n" +
-      new Date().toUTCString().slice(5, 25) + " UTC\n" +
-      "<i>Ticaret tavsiyesi degildir.</i>";
+    if (funding !== null) {
+      if (trendDir === "long"  && funding < 0) { bonusScore++; bonusReasons.push("Funding-"); }
+      if (trendDir === "short" && funding > 0.0003) { bonusScore++; bonusReasons.push("Funding+"); }
+    }
 
-    console.log("[SINYAL] " + sym + " " + direction.toUpperCase());
-    await tgSend(msg);
+    if (trendDir === "long"  && ob.ratio > 1.5) { bonusScore++; bonusReasons.push("OB-Strong"); }
+    if (trendDir === "short" && ob.ratio < 0.67) { bonusScore++; bonusReasons.push("OB-Strong"); }
 
-    var tpHit = { tp1: false, tp2: false, sl: false };
-    var trackInterval = setInterval(async function() {
-      try {
-        var d = await bGet("/fapi/v1/ticker/price", { symbol: sym });
-        if (!d) return;
-        var cur = parseFloat(d.price);
+    if (trendDir === "long"  && taker.buyPct > 0.65) { bonusScore++; bonusReasons.push("Taker-Strong"); }
+    if (trendDir === "short" && taker.buyPct < 0.35) { bonusScore++; bonusReasons.push("Taker-Strong"); }
 
-        if (direction === "long") {
-          if (!tpHit.tp1 && cur >= tp1) {
-            tpHit.tp1 = true;
-            await tgSend("🟡 <b>TP1 HIT!</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nSL girise cek! (" + fmtPrice(price) + ")\nTP2/TP3 icin pozisyonu koru.");
-          }
-          if (!tpHit.tp2 && cur >= tp2) {
-            tpHit.tp2 = true;
-            await tgSend("🟢 <b>TP2 HIT!</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nTP3 hedefliyorsan pozisyonu koru!\nHedef: " + fmtPrice(tp3));
-          }
-          if (!tpHit.sl && cur <= sl) {
-            tpHit.sl = true;
-            await tgSend("🔴 <b>STOP!</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nSL tetiklendi: " + fmtPrice(sl));
-            clearInterval(trackInterval);
-          }
-        } else {
-          if (!tpHit.tp1 && cur <= tp1) {
-            tpHit.tp1 = true;
-            await tgSend("🟡 <b>TP1 HIT!</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nSL girise cek! (" + fmtPrice(price) + ")\nTP2/TP3 icin pozisyonu koru.");
-          }
-          if (!tpHit.tp2 && cur <= tp2) {
-            tpHit.tp2 = true;
-            await tgSend("🟢 <b>TP2 HIT!</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nTP3 hedefliyorsan pozisyonu koru!\nHedef: " + fmtPrice(tp3));
-          }
-          if (!tpHit.sl && cur >= sl) {
-            tpHit.sl = true;
-            await tgSend("🔴 <b>STOP!</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nSL tetiklendi: " + fmtPrice(sl));
-            clearInterval(trackInterval);
-          }
-        }
-        setTimeout(function() { clearInterval(trackInterval); }, 14400000);
-      } catch(e) {}
-    }, 30000);
+    if (oi > oiPrev * 1.003 && trendDir === "long")  { bonusScore++; bonusReasons.push("OI-Spike"); }
+    if (oi < oiPrev * 0.997 && trendDir === "short") { bonusScore++; bonusReasons.push("OI-Spike"); }
+
+    if (bonusScore < 2) return;
+
+    const pendKey = sym + "_" + trendDir;
+    const lastBarTime = lastClosed.time;
+
+    if (!pendingConfirmations[pendKey] || pendingConfirmations[pendKey].barTime !== lastBarTime) {
+      pendingConfirmations[pendKey] = {
+        barTime: lastBarTime,
+        direction: trendDir,
+        snapshot: { price, tp1Level, tp2Level, slLevel, atrNow, funding, bonusScore, bonusReasons }
+      };
+      console.log("[PENDING] " + sym + " " + trendDir.toUpperCase() + " - waiting N+1 confirmation");
+      return;
+    }
+
+    return;
 
   } catch(e) {
     console.error("[ERR] " + sym + ": " + e.message);
   }
 }
 
+async function checkPendingConfirmations() {
+  for (const key in pendingConfirmations) {
+    const pending = pendingConfirmations[key];
+    const sym = key.split("_")[0];
+
+    try {
+      const c5m = await getCandles(sym, "5m", 5);
+      if (!c5m) continue;
+
+      const n1bar = c5m.find(c => c.time > pending.barTime);
+      if (!n1bar) continue;
+
+      let confirmed = false;
+      if (pending.direction === "long"  && n1bar.close > n1bar.open && n1bar.close > pending.snapshot.price) confirmed = true;
+      if (pending.direction === "short" && n1bar.close < n1bar.open && n1bar.close < pending.snapshot.price) confirmed = true;
+
+      if (confirmed) {
+        await fireSignal(sym, pending);
+        lastSignal[sym] = Date.now();
+      } else {
+        console.log("[CANCEL] " + sym + " " + pending.direction + " - N+1 closed against");
+      }
+
+      delete pendingConfirmations[key];
+
+    } catch(e) {
+      console.error("[CONFIRM ERR] " + sym + ": " + e.message);
+    }
+  }
+}
+
+async function fireSignal(sym, pending) {
+  const s = pending.snapshot;
+  const dir = pending.direction;
+
+  const c = await getCandles(sym, "5m", 2);
+  if (!c) return;
+  const entry = c[c.length - 1].open;
+
+  const sl  = s.slLevel;
+  const tp1 = s.tp1Level;
+  const tp2 = s.tp2Level;
+
+  const slDist  = Math.abs(entry - sl);
+  const tp1Dist = Math.abs(tp1 - entry);
+  const tp2Dist = Math.abs(tp2 - entry);
+  const slPct   = (slDist / entry * 100).toFixed(2);
+  const tp1Pct  = (tp1Dist / entry * 100).toFixed(2);
+  const tp2Pct  = (tp2Dist / entry * 100).toFixed(2);
+  const rr1 = (tp1Dist / slDist).toFixed(2);
+  const rr2 = (tp2Dist / slDist).toFixed(2);
+
+  const lev = 20;
+  const label = dir === "long" ? "LONG" : "SHORT";
+  const fund = s.funding !== null ? (s.funding * 100).toFixed(4) + "%" : "-";
+
+  const msg =
+    "<b>[" + label + "] " + sym + "</b>\n" +
+    "-------------\n" +
+    "<b>Giris:</b> " + fmtPrice(entry) + "\n\n" +
+    "<b>TP1:</b> " + fmtPrice(tp1) + " (" + tp1Pct + "% | " + lev + "x: " + (parseFloat(tp1Pct)*lev).toFixed(0) + "%) %60\n" +
+    "<b>TP2:</b> " + fmtPrice(tp2) + " (" + tp2Pct + "% | " + lev + "x: " + (parseFloat(tp2Pct)*lev).toFixed(0) + "%) %40\n" +
+    "<b>SL :</b> " + fmtPrice(sl)  + " (-" + slPct + "% | " + lev + "x: -" + (parseFloat(slPct)*lev).toFixed(0) + "%)\n" +
+    "-------------\n" +
+    "<b>R:R TP1:</b> 1:" + rr1 + " | <b>TP2:</b> 1:" + rr2 + "\n" +
+    "<b>Funding:</b> " + fund + "\n" +
+    "<b>Bonus:</b> " + s.bonusScore + "/4 (" + s.bonusReasons.join(", ") + ")\n" +
+    "-------------\n" +
+    "Max 6 mum (30dk) - Otomatik kapat\n" +
+    "<i>TP1 sonrasi SL girise cek!</i>\n" +
+    new Date().toUTCString().slice(5, 25) + " UTC";
+
+  console.log("[SIGNAL] " + sym + " " + dir.toUpperCase() + " @ " + fmtPrice(entry));
+  await tgSend(msg);
+
+  trackTrade(sym, dir, entry, sl, tp1, tp2);
+}
+
+async function trackTrade(sym, dir, entry, sl, tp1, tp2) {
+  var startTime = Date.now();
+  var tp1Hit = false, tp2Hit = false, slHit = false;
+  var barCount = 0;
+  var lastBarTime = 0;
+
+  const interval = setInterval(async function() {
+    try {
+      const c = await getCandles(sym, "5m", 2);
+      if (c && c.length > 0) {
+        const curBarTime = c[c.length - 1].time;
+        if (lastBarTime !== 0 && curBarTime !== lastBarTime) barCount++;
+        lastBarTime = curBarTime;
+      }
+
+      const d = await bGet("/fapi/v1/ticker/price", { symbol: sym });
+      if (!d) return;
+      const cur = parseFloat(d.price);
+
+      if (dir === "long") {
+        if (!tp1Hit && cur >= tp1) {
+          tp1Hit = true;
+          await tgSend("<b>TP1 HIT</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\n%60 kapat, SL girise cek (" + fmtPrice(entry) + ")");
+        }
+        if (!tp2Hit && cur >= tp2) {
+          tp2Hit = true;
+          await tgSend("<b>TP2 HIT</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nPozisyonu tamamen kapat!");
+          clearInterval(interval);
+          return;
+        }
+        if (!slHit && cur <= sl) {
+          slHit = true;
+          await tgSend("<b>SL HIT</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nPozisyon kapandi: " + fmtPrice(sl));
+          clearInterval(interval);
+          return;
+        }
+      } else {
+        if (!tp1Hit && cur <= tp1) {
+          tp1Hit = true;
+          await tgSend("<b>TP1 HIT</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\n%60 kapat, SL girise cek (" + fmtPrice(entry) + ")");
+        }
+        if (!tp2Hit && cur <= tp2) {
+          tp2Hit = true;
+          await tgSend("<b>TP2 HIT</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nPozisyonu tamamen kapat!");
+          clearInterval(interval);
+          return;
+        }
+        if (!slHit && cur >= sl) {
+          slHit = true;
+          await tgSend("<b>SL HIT</b> " + sym + "\nFiyat: " + fmtPrice(cur) + "\nPozisyon kapandi: " + fmtPrice(sl));
+          clearInterval(interval);
+          return;
+        }
+      }
+
+      if (barCount >= MAX_BARS) {
+        await tgSend("<b>VAKIT DOLDU</b> " + sym + " " + dir.toUpperCase() + "\n6 mum gecti, TP/SL vurulmadi.\nFiyat: " + fmtPrice(cur) + "\n<b>Pozisyonu manuel kapat!</b>");
+        clearInterval(interval);
+        return;
+      }
+
+      if (Date.now() - startTime > 60 * 60000) {
+        clearInterval(interval);
+      }
+
+    } catch(e) {}
+  }, 20000);
+}
+
+async function updateBtcTrend() {
+  const c = await getCandles("BTCUSDT", "15m", 50);
+  if (c) btcTrend15m = calcEMATrend(c, 9, 21);
+}
+
 async function main() {
-  console.log("OBV Bot v1.0 basliyor...");
-  console.log("Semboller: " + SYMBOLS.join(", "));
-  console.log("Strateji: OBV Divergence + Funding Rate");
+  console.log("ScalpMaster v2.0 starting...");
+  console.log("Symbols: " + SYMBOLS.join(", "));
+  console.log("System: Triple Confirmation + Order Flow");
 
   await tgSend(
-    "<b>OBV Bot v1.0</b>\n\n" +
-    "Strateji: OBV Divergence + Funding Rate\n" +
-    "Semboller: BTCUSDT + ETHUSDT\n" +
-    "Tarama: Her dakika\n" +
-    "TP/SL takibi: Otomatik\n\n" +
-    "<i>Basladi!</i>"
+    "<b>ScalpMaster v2.0</b>\n\n" +
+    "Sistem: Uclu Onay + Order Flow\n" +
+    "Semboller: " + SYMBOLS.length + " coin\n" +
+    "Confirmation: 1-Bar (5dk)\n" +
+    "Max sure: 6 mum (30dk)\n" +
+    "Kaldirac: 20x\n\n" +
+    "<i>Basladi! Sinyal bekleniyor...</i>"
   );
 
   while (true) {
     const t0 = Date.now();
-    for (const sym of SYMBOLS) {
-      await scanSymbol(sym);
+    try {
+      await updateBtcTrend();
+      await checkPendingConfirmations();
+      for (const sym of SYMBOLS) {
+        await scanSymbol(sym);
+        await new Promise(r => setTimeout(r, 200));
+      }
+    } catch(e) {
+      console.error("[MAIN ERR] " + e.message);
     }
     await new Promise(r => setTimeout(r, Math.max(0, SCAN_MS - (Date.now() - t0))));
   }
